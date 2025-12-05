@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Minimal Minecraft-like Voxel Demo — three.js</title>
+  <style>
+    html,body{height:100%;margin:0;overflow:hidden;font-family:system-ui,Segoe UI,Roboto,Arial}
+    #overlay{position:fixed;left:12px;top:12px;background:rgba(0,0,0,0.45);color:#fff;padding:10px;border-radius:8px;z-index:10;min-width:220px}
+    #overlay h3{margin:0 0 8px 0;font-size:14px}
+    #overlay label{display:block;font-size:12px;margin-top:6px}
+    #overlay button,select,input{width:100%;box-sizing:border-box;margin-top:6px}
+    #canvas-holder{width:100%;height:100%}
+    .hint{font-size:11px;opacity:0.9}
+    .small{font-size:12px}
+  </style>
+</head>
+<body>
+  <div id="overlay">
+    <h3>Mini Minecraft (three.js)</h3>
+    <div class="hint">Left click: remove block • Right click: place block</div>
+    <div class="hint">WASD: move (pointer lock) • E: toggle orbit/or first-person</div>
+    <label class="small">Block type</label>
+    <select id="blockType"></select>
+    <label class="small">World size (XZ)</label>
+    <input id="worldSize" type="range" min="8" max="64" step="8" value="32">
+    <div class="small" id="worldSizeVal">32</div>
+    <button id="regen">Regenerate</button>
+    <button id="toggleControls">Toggle Controls</button>
+    <label class="small">Options</label>
+    <div style="display:flex;gap:6px"><button id="wireframe">Wireframe</button><button id="clear">Clear</button></div>
+    <div style="margin-top:8px;font-size:11px;opacity:0.9">Made with three.js — easy to extend: textures, chunks, instanced meshes, networking.</div>
+  </div>
+  <div id="canvas-holder"></div>
+
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.154.0/build/three.module.js';
+    import { PointerLockControls } from 'https://unpkg.com/three@0.154.0/examples/jsm/controls/PointerLockControls.js';
+    import { OrbitControls } from 'https://unpkg.com/three@0.154.0/examples/jsm/controls/OrbitControls.js';
+
+    // ---------------------------------------------------
+    // Config / easy-to-change features
+    // ---------------------------------------------------
+    const CONFIG = {
+      blockSize: 1,
+      defaultWorldSize: 32,
+      maxHeight: 12,
+      skyColor: 0x87ceeb,
+      gravity: -9.8,
+    };
+
+    // Block palette (easy to extend or load textures)
+    const BLOCK_TYPES = [
+      { id: 0, name: 'Dirt', color: 0x8B5A2B },
+      { id: 1, name: 'Grass', color: 0x4CAF50 },
+      { id: 2, name: 'Stone', color: 0x8A8A8A },
+      { id: 3, name: 'Sand', color: 0xEED6A7 },
+      { id: 4, name: 'Water', color: 0x3FA7D6, transparent: true, opacity:0.6 },
+    ];
+
+    // Globals
+    let scene, camera, renderer, raycaster, mouse, clock;
+    let controlsFP, controlsOrbit, usePointerLock = true;
+    let blockGroup;
+    let blocks = new Map(); // key -> mesh
+    let currentBlockType = BLOCK_TYPES[0];
+    let worldSize = CONFIG.defaultWorldSize;
+
+    // HTML elements
+    const canvasHolder = document.getElementById('canvas-holder');
+    const blockTypeSelect = document.getElementById('blockType');
+    const regenBtn = document.getElementById('regen');
+    const worldSizeRange = document.getElementById('worldSize');
+    const worldSizeVal = document.getElementById('worldSizeVal');
+    const toggleControlsBtn = document.getElementById('toggleControls');
+    const wireframeBtn = document.getElementById('wireframe');
+    const clearBtn = document.getElementById('clear');
+
+    // Fill palette select
+    BLOCK_TYPES.forEach(b => {
+      let opt = document.createElement('option'); opt.value = b.id; opt.textContent = b.name; blockTypeSelect.appendChild(opt);
+    });
+    blockTypeSelect.addEventListener('change', e => { currentBlockType = BLOCK_TYPES.find(b=>b.id==+e.target.value); });
+
+    worldSizeRange.value = worldSize; worldSizeVal.textContent = worldSize;
+    worldSizeRange.addEventListener('input', (e)=>{ worldSize = +e.target.value; worldSizeVal.textContent = worldSize; });
+    regenBtn.addEventListener('click', ()=>{ generateTerrain(); });
+    toggleControlsBtn.addEventListener('click', ()=>{ toggleControls(); });
+    wireframeBtn.addEventListener('click', ()=>{ toggleWireframe(); });
+    clearBtn.addEventListener('click', ()=>{ clearWorld(); });
+
+    // ---------------------------------------------------
+    // Init Three
+    // ---------------------------------------------------
+    function init(){
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(CONFIG.skyColor);
+
+      camera = new THREE.PerspectiveCamera(75, innerWidth/innerHeight, 0.1, 1000);
+      camera.position.set(worldSize/2, CONFIG.maxHeight+6, worldSize*1.2);
+
+      renderer = new THREE.WebGLRenderer({ antialias:true });
+      renderer.setSize(innerWidth, innerHeight);
+      renderer.shadowMap.enabled = true;
+      canvasHolder.appendChild(renderer.domElement);
+
+      // Lights
+      const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 0.8); scene.add(hemi);
+      const sun = new THREE.DirectionalLight(0xffffff, 0.8); sun.position.set(50,100,50); sun.castShadow=true; scene.add(sun);
+
+      // Controls
+      controlsFP = new PointerLockControls(camera, renderer.domElement);
+      controlsOrbit = new OrbitControls(camera, renderer.domElement);
+      controlsOrbit.enabled = false;
+
+      // Pointer lock start on click
+      renderer.domElement.addEventListener('click', ()=>{
+        if(usePointerLock){ controlsFP.lock(); }
+      });
+
+      // Basic movement
+      initMovementControls();
+
+      // Raycaster
+      raycaster = new THREE.Raycaster(); mouse = new THREE.Vector2();
+
+      window.addEventListener('resize', onWindowResize);
+      renderer.domElement.addEventListener('contextmenu', e=>e.preventDefault()); // disable context menu for right click
+      renderer.domElement.addEventListener('pointerdown', onPointerDown);
+
+      clock = new THREE.Clock();
+
+      blockGroup = new THREE.Group(); scene.add(blockGroup);
+
+      // Ground plane to receive clicks when empty
+      const groundMat = new THREE.MeshStandardMaterial({ color:0x2f7a2f });
+      const ground = new THREE.Mesh(new THREE.PlaneGeometry(1000,1000), groundMat);
+      ground.rotation.x = -Math.PI/2; ground.position.y = -2; ground.receiveShadow = true; scene.add(ground);
+
+      generateTerrain();
+      animate();
+    }
+
+    function onWindowResize(){
+      camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight);
+    }
+
+    // ---------------------------------------------------
+    // Simple heightmap using value noise (fast, deterministic)
+    // ---------------------------------------------------
+    function seededRandom(x){
+      // simple hash-based pseudo random - deterministic for integer x
+      let s = Math.sin(x)*10000; return s - Math.floor(s);
+    }
+
+    function valueNoise2D(x, z, scale=10){
+      // bilinear interpolation of corner values
+      const x0 = Math.floor(x); const z0 = Math.floor(z);
+      const xf = x - x0; const zf = z - z0;
+      const v00 = seededRandom(x0*374761393 + z0*668265263);
+      const v10 = seededRandom((x0+1)*374761393 + z0*668265263);
+      const v01 = seededRandom(x0*374761393 + (z0+1)*668265263);
+      const v11 = seededRandom((x0+1)*374761393 + (z0+1)*668265263);
+      const ix0 = v00*(1-xf) + v10*xf;
+      const ix1 = v01*(1-xf) + v11*xf;
+      return ix0*(1-zf) + ix1*zf;
+    }
+
+    function getHeightAt(x,z){
+      // combine layers of noise to make interesting terrain
+      const s = 0.15; // frequency
+      let h = 0;
+      h += valueNoise2D(x*s, z*s) * 4.0;
+      h += valueNoise2D(x*s*2, z*s*2) * 2.0;
+      h += valueNoise2D(x*s*4, z*s*4) * 1.0;
+      h = Math.floor(h);
+      return Math.max(1, Math.min(CONFIG.maxHeight, h + 2));
+    }
+
+    // ---------------------------------------------------
+    // World / block helpers
+    // ---------------------------------------------------
+    function keyFor(x,y,z){ return `${x},${y},${z}`; }
+
+    function addBlock(x,y,z, type=null){
+      if(type===null) type = currentBlockType;
+      const k = keyFor(x,y,z); if(blocks.has(k)) return null;
+      const geometry = new THREE.BoxGeometry(CONFIG.blockSize, CONFIG.blockSize, CONFIG.blockSize);
+      const matOpts = { color:type.color };
+      if(type.transparent){ matOpts.transparent = true; matOpts.opacity = type.opacity ?? 0.6; }
+      const material = new THREE.MeshStandardMaterial(matOpts);
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.position.set(x*CONFIG.blockSize, y*CONFIG.blockSize, z*CONFIG.blockSize);
+      mesh.castShadow = true; mesh.receiveShadow = true;
+      blockGroup.add(mesh); blocks.set(k, {mesh, type});
+      return mesh;
+    }
+
+    function removeBlock(x,y,z){ const k = keyFor(x,y,z); const v = blocks.get(k); if(!v) return false; blockGroup.remove(v.mesh); if(v.mesh.geometry) v.mesh.geometry.dispose(); if(v.mesh.material) v.mesh.material.dispose(); blocks.delete(k); return true; }
+
+    function clearWorld(){ for(const [k,v] of blocks){ blockGroup.remove(v.mesh); if(v.mesh.geometry) v.mesh.geometry.dispose(); if(v.mesh.material) v.mesh.material.dispose(); } blocks.clear(); }
+
+    // ---------------------------------------------------
+    // Generate simple terrain
+    // ---------------------------------------------------
+    function generateTerrain(){
+      clearWorld();
+      const half = Math.floor(worldSize/2);
+      for(let x=0;x<worldSize;x++){
+        for(let z=0;z<worldSize;z++){
+          const worldX = x - half; const worldZ = z - half;
+          const h = getHeightAt(worldX, worldZ);
+          for(let y=0;y<h;y++){
+            // choose block type by y
+            let type = BLOCK_TYPES[0];
+            if(y === h-1) type = BLOCK_TYPES[1]; // grass on top
+            else if(y < 2) type = BLOCK_TYPES[0];
+            else type = (y > 6 ? BLOCK_TYPES[2] : BLOCK_TYPES[0]);
+            addBlock(worldX, y, worldZ, type);
+          }
+          // simple water fill
+          if(h < 3){ for(let y=h;y<3;y++) addBlock(worldX,y,worldZ,BLOCK_TYPES[4]); }
+        }
+      }
+    }
+
+    // ---------------------------------------------------
+    // Interactions: raycast for add/remove
+    // left click remove, right click add adjacent (face normal)
+    // ---------------------------------------------------
+    function onPointerDown(event){
+      // compute mouse in normalized coords
+      const rect = renderer.domElement.getBoundingClientRect();
+      mouse.x = ( (event.clientX - rect.left) / rect.width ) * 2 - 1;
+      mouse.y = - ( (event.clientY - rect.top) / rect.height ) * 2 + 1;
+      raycaster.setFromCamera(mouse, camera);
+      const intersects = raycaster.intersectObjects(blockGroup.children, false);
+      if(intersects.length > 0){
+        const hit = intersects[0];
+        const pos = hit.object.position.clone().divideScalar(CONFIG.blockSize);
+        const bx = Math.round(pos.x), by = Math.round(pos.y), bz = Math.round(pos.z);
+        if(event.button === 0){ // left -> remove
+          removeBlock(bx,by,bz);
+        } else if(event.button === 2){ // right -> place
+          // compute face normal in world space
+          const normal = hit.face.normal.clone();
+          normal.applyMatrix3(new THREE.Matrix3().getNormalMatrix(hit.object.matrixWorld));
+          const placeX = bx + Math.round(normal.x);
+          const placeY = by + Math.round(normal.y);
+          const placeZ = bz + Math.round(normal.z);
+          addBlock(placeX, placeY, placeZ, currentBlockType);
+        }
+      } else {
+        // clicked empty space - if right-click, place block at an approximate ground position
+        if(event.button === 2){
+          // intersect with ground plane y=-2
+          const planeY = -2 + CONFIG.blockSize/2;
+          const dir = raycaster.ray.direction; const orig = raycaster.ray.origin;
+          const t = (planeY - orig.y) / dir.y; if(t>0){ const p = orig.clone().add(dir.clone().multiplyScalar(t)); const bx=Math.round(p.x/CONFIG.blockSize), bz=Math.round(p.z/CONFIG.blockSize); addBlock(bx, 0, bz, currentBlockType); }
+        }
+      }
+    }
+
+    // ---------------------------------------------------
+    // Movement (WASD) for pointer lock
+    // ---------------------------------------------------
+    const moveState = { forward:false, back:false, left:false, right:false };
+    let velocity = new THREE.Vector3();
+    function initMovementControls(){
+      document.addEventListener('keydown', (e)=>{
+        if(e.code==='KeyW') moveState.forward=true;
+        if(e.code==='KeyS') moveState.back=true;
+        if(e.code==='KeyA') moveState.left=true;
+        if(e.code==='KeyD') moveState.right=true;
+        if(e.code==='KeyE') toggleControls();
+      });
+      document.addEventListener('keyup', (e)=>{
+        if(e.code==='KeyW') moveState.forward=false;
+        if(e.code==='KeyS') moveState.back=false;
+        if(e.code==='KeyA') moveState.left=false;
+        if(e.code==='KeyD') moveState.right=false;
+      });
+
+      controlsFP.addEventListener('lock', ()=>{ usePointerLock = true; controlsOrbit.enabled = false; });
+      controlsFP.addEventListener('unlock', ()=>{ usePointerLock = false; });
+    }
+
+    function toggleControls(){ usePointerLock = !usePointerLock; if(usePointerLock){ controlsFP.lock(); controlsOrbit.enabled = false; } else { controlsFP.unlock(); controlsOrbit.enabled = true; } }
+
+    // ---------------------------------------------------
+    // Wireframe toggle
+    // ---------------------------------------------------
+    function toggleWireframe(){ for(const [,v] of blocks){ v.mesh.material.wireframe = !v.mesh.material.wireframe; } }
+
+    // ---------------------------------------------------
+    // Animation loop
+    // ---------------------------------------------------
+    function animate(){ requestAnimationFrame(animate);
+      const dt = Math.min(0.05, clock.getDelta());
+      // movement
+      if(controlsFP.isLocked){
+        const speed = 8;
+        const forward = (moveState.forward? 1:0) - (moveState.back?1:0);
+        const strafe = (moveState.right?1:0) - (moveState.left?1:0);
+        const dir = new THREE.Vector3();
+        controlsFP.getDirection(dir);
+        dir.y = 0; dir.normalize();
+        const right = new THREE.Vector3().crossVectors(dir, camera.up).normalize();
+        const move = dir.multiplyScalar(forward).add(right.multiplyScalar(strafe)).multiplyScalar(speed*dt);
+        controlsFP.getObject().position.add(move);
+        // keep above ground
+        if(controlsFP.getObject().position.y < -1) controlsFP.getObject().position.y = -1;
+      }
+
+      // Orbit update if used
+      if(!usePointerLock) controlsOrbit.update();
+
+      renderer.render(scene, camera);
+    }
+
+    // start
+    init();
+
+    // ---------------------------------------------------
+    // Expose some helpers to window for tinkering in console
+    // ---------------------------------------------------
+    window.VOXEL = { addBlock, removeBlock, clearWorld, generateTerrain, blocks, scene, camera };
+  </script>
+</body>
+</html>
