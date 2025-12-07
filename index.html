@@ -3,13 +3,13 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Minecraft Clone - Face Culling & Atlas</title>
+    <title>Minecraft Clone - Water Update</title>
     <style>
         body {
             margin: 0;
             overflow: hidden;
             font-family: 'Minecraft', monospace;
-            background-color: #87CEEB; /* Sky blue */
+            background-color: #000;
         }
         
         #crosshair {
@@ -70,6 +70,7 @@
         .slot.active {
             border-color: white;
             transform: scale(1.1);
+            box-shadow: 0 0 10px rgba(255,255,255,0.5);
         }
 
         #instructions {
@@ -84,9 +85,13 @@
             border-radius: 10px;
             cursor: pointer;
             z-index: 20;
+            backdrop-filter: blur(5px);
+            border: 1px solid rgba(255,255,255,0.1);
         }
+        
+        h1 { margin-top: 0; text-shadow: 0 0 10px #2196f3; }
+        .rtx-badge { color: #00ff00; font-weight: bold; font-size: 0.9em; }
     </style>
-    <!-- Load Three.js and dependencies from CDN -->
     <script async src="https://unpkg.com/es-module-shims@1.6.3/dist/es-module-shims.js"></script>
     <script type="importmap">
       {
@@ -103,15 +108,18 @@
     <div id="ui">
         FPS: <span id="fps">0</span><br>
         Coords: <span id="coords">0, 0, 0</span><br>
-        Chunks: <span id="chunks-loaded">0</span>
+        Chunks: <span id="chunks-loaded">0</span><br>
+        Time: <span id="time-display">Day</span><br>
+        State: <span id="state-display">Walking</span><br>
+        <span class="rtx-badge">RTX: WATER FIXED</span>
     </div>
     
     <div id="instructions">
-        <h1>Minecraft JS</h1>
+        <h1>Minecraft Water Fix</h1>
         <p>Click to Start</p>
-        <p>WASD to Move | SPACE to Jump</p>
+        <p>WASD to Move | SPACE to Jump/Swim</p>
         <p>Click to Break | Right Click to Place</p>
-        <p>1-5 to Select Block</p>
+        <p>1-8 to Select Block</p>
     </div>
 
     <div id="block-selector">
@@ -126,6 +134,7 @@
         // --- Configuration ---
         const CHUNK_SIZE = 16;
         const CHUNK_HEIGHT = 64; 
+        const SEA_LEVEL = 12;
         const RENDER_DISTANCE = 4;
         
         // --- Block Definitions ---
@@ -142,7 +151,6 @@
             PLANKS: 9
         };
 
-        // Atlas IDs (Indices in the texture atlas grid)
         const ATLAS_IDS = {
             DIRT: 0,
             GRASS_SIDE: 1,
@@ -157,8 +165,6 @@
             PLANKS: 10
         };
 
-        // Map Block ID to Atlas IDs for faces [px, nx, py, ny, pz, nz]
-        // or helper properties
         const BLOCK_MATS = {
             [BLOCKS.GRASS]: { top: ATLAS_IDS.GRASS_TOP, bottom: ATLAS_IDS.DIRT, side: ATLAS_IDS.GRASS_SIDE },
             [BLOCKS.DIRT]: { all: ATLAS_IDS.DIRT },
@@ -171,7 +177,6 @@
             [BLOCKS.PLANKS]: { all: ATLAS_IDS.PLANKS }
         };
 
-        // Colors for UI fallback
         const BLOCK_COLORS = {
             [BLOCKS.GRASS]: '#567d46',
             [BLOCKS.DIRT]: '#795548',
@@ -190,23 +195,50 @@
         let playerVelocity = new THREE.Vector3();
         let playerDirection = new THREE.Vector3();
         let canJump = false;
+        let isSwimming = false;
         let raycaster;
         let selectedBlock = BLOCKS.GRASS;
         let atlasMaterial;
-        let atlasTexture;
+        
+        // RTX Globals
+        let cubeCamera, cubeRenderTarget;
+        let reflectionUpdateCounter = 0;
+        
+        // Day/Night & Atmosphere
+        let sunMesh, moonMesh;
+        let dirLight, ambientLight;
+        let dayTime = 0; 
+        const DAY_DURATION = 60; 
+        const SHADOW_SIZE = 150;
+        let currentSkyColor = new THREE.Color(0x87CEEB); 
 
-        // --- Texture Atlas Generation ---
+        // --- PBR Texture Generation ---
         function createTextureAtlas() {
             const TILE_SIZE = 64;
             const COLS = 4;
             const ROWS = 4;
-            const canvas = document.createElement('canvas');
-            canvas.width = COLS * TILE_SIZE;
-            canvas.height = ROWS * TILE_SIZE;
-            const ctx = canvas.getContext('2d');
+            
+            const colorCanvas = document.createElement('canvas');
+            const roughCanvas = document.createElement('canvas');
+            const metalCanvas = document.createElement('canvas');
 
-            // Helper: Noise rect
-            const noiseRect = (x, y, color, intensity = 20) => {
+            [colorCanvas, roughCanvas, metalCanvas].forEach(c => {
+                c.width = COLS * TILE_SIZE;
+                c.height = ROWS * TILE_SIZE;
+            });
+
+            const ctxC = colorCanvas.getContext('2d');
+            const ctxR = roughCanvas.getContext('2d');
+            const ctxM = metalCanvas.getContext('2d');
+
+            // --- PBR Defaults ---
+            ctxR.fillStyle = '#dddddd'; 
+            ctxR.fillRect(0, 0, roughCanvas.width, roughCanvas.height);
+            
+            ctxM.fillStyle = '#000000'; 
+            ctxM.fillRect(0, 0, metalCanvas.width, metalCanvas.height);
+
+            const noiseRect = (ctx, x, y, color, intensity = 20) => {
                 ctx.fillStyle = color;
                 ctx.fillRect(x, y, TILE_SIZE, TILE_SIZE);
                 for(let i=0; i<TILE_SIZE*TILE_SIZE/2; i++) {
@@ -225,117 +257,123 @@
             };
 
             // 0: Dirt
-            drawTile(ATLAS_IDS.DIRT, (x,y) => noiseRect(x,y, '#795548', 40));
-            
+            drawTile(ATLAS_IDS.DIRT, (x,y) => { noiseRect(ctxC, x,y, '#795548', 40); });
             // 1: Grass Side
             drawTile(ATLAS_IDS.GRASS_SIDE, (x,y) => {
-                noiseRect(x,y, '#795548', 40);
-                ctx.fillStyle = '#567d46';
-                ctx.fillRect(x, y, TILE_SIZE, TILE_SIZE/4);
-                for(let i=0; i<20; i++) ctx.fillRect(x + Math.random()*TILE_SIZE, y + TILE_SIZE/4, 4, 4);
+                noiseRect(ctxC, x,y, '#795548', 40);
+                ctxC.fillStyle = '#567d46'; ctxC.fillRect(x, y, TILE_SIZE, TILE_SIZE/4);
+                for(let i=0; i<20; i++) {
+                    const rx = Math.random()*TILE_SIZE;
+                    ctxC.fillStyle = '#567d46'; ctxC.fillRect(x + rx, y + TILE_SIZE/4, 4, 4);
+                }
             });
-
             // 2: Grass Top
             drawTile(ATLAS_IDS.GRASS_TOP, (x,y) => {
-                noiseRect(x,y, '#567d46', 40);
-                ctx.fillStyle = '#4a6b3c';
-                for(let i=0; i<50; i++) ctx.fillRect(x + Math.random()*TILE_SIZE, y + Math.random()*TILE_SIZE, 4, 4);
+                noiseRect(ctxC, x,y, '#567d46', 40);
+                ctxC.fillStyle = '#4a6b3c';
+                for(let i=0; i<50; i++) ctxC.fillRect(x + Math.random()*TILE_SIZE, y + Math.random()*TILE_SIZE, 4, 4);
             });
-
             // 3: Stone
-            drawTile(ATLAS_IDS.STONE, (x,y) => noiseRect(x,y, '#808080', 30));
-
+            drawTile(ATLAS_IDS.STONE, (x,y) => { noiseRect(ctxC, x,y, '#808080', 30); });
             // 4: Wood Side
             drawTile(ATLAS_IDS.WOOD_SIDE, (x,y) => {
-                ctx.fillStyle = '#5d4037';
-                ctx.fillRect(x,y,TILE_SIZE,TILE_SIZE);
-                ctx.fillStyle = '#4e342e';
-                for(let i=0; i<TILE_SIZE; i+=8) ctx.fillRect(x+i, y, 4, TILE_SIZE);
+                ctxC.fillStyle = '#5d4037'; ctxC.fillRect(x,y,TILE_SIZE,TILE_SIZE);
+                ctxC.fillStyle = '#4e342e';
+                for(let i=0; i<TILE_SIZE; i+=8) ctxC.fillRect(x+i, y, 4, TILE_SIZE);
             });
-
             // 5: Wood Top
             drawTile(ATLAS_IDS.WOOD_TOP, (x,y) => {
-                noiseRect(x,y, '#6d4c41', 20);
-                ctx.strokeStyle = '#4e342e';
-                ctx.lineWidth = 2;
-                ctx.beginPath();
-                for(let i=10; i<TILE_SIZE/2; i+=6) { ctx.arc(x+TILE_SIZE/2, y+TILE_SIZE/2, i, 0, Math.PI*2); }
-                ctx.stroke();
+                noiseRect(ctxC, x,y, '#6d4c41', 20);
+                ctxC.strokeStyle = '#4e342e'; ctxC.lineWidth = 2; ctxC.beginPath();
+                for(let i=10; i<TILE_SIZE/2; i+=6) { ctxC.arc(x+TILE_SIZE/2, y+TILE_SIZE/2, i, 0, Math.PI*2); }
+                ctxC.stroke();
             });
-
             // 6: Leaves
             drawTile(ATLAS_IDS.LEAVES, (x,y) => {
-                ctx.fillStyle = '#2e7d32';
-                ctx.fillRect(x,y,TILE_SIZE,TILE_SIZE);
-                ctx.fillStyle = '#1b5e20';
-                for(let i=0; i<100; i++) ctx.fillRect(x + Math.random()*TILE_SIZE, y + Math.random()*TILE_SIZE, 6, 6);
+                ctxC.fillStyle = '#2e7d32'; ctxC.fillRect(x,y,TILE_SIZE,TILE_SIZE);
+                ctxC.fillStyle = '#1b5e20';
+                for(let i=0; i<100; i++) ctxC.fillRect(x + Math.random()*TILE_SIZE, y + Math.random()*TILE_SIZE, 6, 6);
             });
-
             // 7: Sand
-            drawTile(ATLAS_IDS.SAND, (x,y) => noiseRect(x,y, '#e1c699', 20));
+            drawTile(ATLAS_IDS.SAND, (x,y) => { noiseRect(ctxC, x,y, '#e1c699', 20); });
 
-            // 8: Water
-            drawTile(ATLAS_IDS.WATER, (x,y) => noiseRect(x,y, '#2196f3', 10));
+            // 8: Water (REFINED REFLECTIONS)
+            drawTile(ATLAS_IDS.WATER, (x,y) => {
+                ctxC.clearRect(x,y,TILE_SIZE,TILE_SIZE); 
+                // Darker blue for better contrast with reflection
+                ctxC.fillStyle = 'rgba(20, 60, 100, 0.6)'; 
+                ctxC.fillRect(x,y,TILE_SIZE,TILE_SIZE);
+                
+                // Roughness: 0 (Mirror)
+                ctxR.fillStyle = '#000000'; 
+                ctxR.fillRect(x,y,TILE_SIZE,TILE_SIZE);
+                
+                // Metalness: Very High (Reflective)
+                ctxM.fillStyle = '#cccccc'; 
+                ctxM.fillRect(x,y,TILE_SIZE,TILE_SIZE);
+            });
 
             // 9: Coal Ore
             drawTile(ATLAS_IDS.COAL_ORE, (x,y) => {
-                noiseRect(x,y, '#808080', 30);
-                ctx.fillStyle = '#111';
-                for(let i=0; i<8; i++) ctx.fillRect(x + Math.random()*TILE_SIZE, y + Math.random()*TILE_SIZE, 8, 8);
+                noiseRect(ctxC, x,y, '#808080', 30);
+                for(let i=0; i<8; i++) {
+                    const rx = Math.random()*TILE_SIZE;
+                    const ry = Math.random()*TILE_SIZE;
+                    ctxC.fillStyle = '#111'; ctxC.fillRect(x + rx, y + ry, 8, 8);
+                    ctxM.fillStyle = '#ffffff'; ctxM.fillRect(x + rx, y + ry, 8, 8);
+                }
             });
 
             // 10: Planks
             drawTile(ATLAS_IDS.PLANKS, (x,y) => {
-                ctx.fillStyle = '#a1887f';
-                ctx.fillRect(x,y,TILE_SIZE,TILE_SIZE);
-                ctx.fillStyle = '#6d4c41';
-                ctx.fillRect(x, y + TILE_SIZE/4, TILE_SIZE, 2);
-                ctx.fillRect(x, y + TILE_SIZE/2, TILE_SIZE, 2);
-                ctx.fillRect(x, y + TILE_SIZE*0.75, TILE_SIZE, 2);
+                ctxC.fillStyle = '#a1887f'; ctxC.fillRect(x,y,TILE_SIZE,TILE_SIZE);
+                ctxC.fillStyle = '#6d4c41';
+                ctxC.fillRect(x, y + TILE_SIZE/4, TILE_SIZE, 2);
+                ctxC.fillRect(x, y + TILE_SIZE/2, TILE_SIZE, 2);
+                ctxC.fillRect(x, y + TILE_SIZE*0.75, TILE_SIZE, 2);
             });
 
-            atlasTexture = new THREE.CanvasTexture(canvas);
-            atlasTexture.magFilter = THREE.NearestFilter;
-            atlasTexture.minFilter = THREE.NearestFilter;
-            atlasTexture.colorSpace = THREE.SRGBColorSpace;
-
-            // Create material
-            atlasMaterial = new THREE.MeshLambertMaterial({ 
-                map: atlasTexture, 
-                transparent: true,
-                alphaTest: 0.5,
-                side: THREE.DoubleSide // Useful for water or inside blocks if camera clips
-            });
-            
-            // Return info for UI
-            return { canvas, COLS, ROWS };
-        }
-
-        // --- UI Setup ---
-        function initUI(atlasInfo) {
-            const selector = document.getElementById('block-selector');
-            const slots = [BLOCKS.GRASS, BLOCKS.DIRT, BLOCKS.STONE, BLOCKS.WOOD, BLOCKS.LEAVES, BLOCKS.SAND, BLOCKS.PLANKS, BLOCKS.COAL_ORE];
-            
-            // Helper to get crop coords for UI
-            const getBackgroundPos = (blockId) => {
-                const props = BLOCK_MATS[blockId];
-                const atlasId = props.side || props.all || props.top || 0;
-                const col = atlasId % atlasInfo.COLS;
-                const row = Math.floor(atlasId / atlasInfo.COLS);
-                // 100% * COLS because background-size is relative to element
-                return `${-col * 100}% ${-row * 100}%`;
+            const makeTex = (c) => {
+                const t = new THREE.CanvasTexture(c);
+                t.magFilter = THREE.NearestFilter;
+                t.minFilter = THREE.NearestFilter;
+                t.colorSpace = THREE.SRGBColorSpace;
+                return t;
             };
 
+            const map = makeTex(colorCanvas);
+            const roughnessMap = makeTex(roughCanvas);
+            roughnessMap.colorSpace = THREE.NoColorSpace;
+            const metalnessMap = makeTex(metalCanvas);
+            metalnessMap.colorSpace = THREE.NoColorSpace;
+
+            atlasMaterial = new THREE.MeshStandardMaterial({ 
+                map: map,
+                roughnessMap: roughnessMap,
+                metalnessMap: metalnessMap,
+                transparent: true,
+                alphaTest: 0.1,
+                side: THREE.DoubleSide,
+                roughness: 1.0, 
+                metalness: 1.0, 
+                envMapIntensity: 1.5
+            });
+            
+            return { canvas: colorCanvas, COLS, ROWS };
+        }
+
+        function initUI(atlasInfo) {
+            const selector = document.getElementById('block-selector');
+            const slots = [BLOCKS.GRASS, BLOCKS.DIRT, BLOCKS.STONE, BLOCKS.WOOD, BLOCKS.LEAVES, BLOCKS.SAND, BLOCKS.PLANKS, BLOCKS.COAL_ORE, BLOCKS.WATER];
+            
             slots.forEach((blockId, index) => {
                 const el = document.createElement('div');
                 el.className = 'slot' + (index === 0 ? ' active' : '');
                 el.dataset.id = blockId;
-                
                 el.style.backgroundColor = BLOCK_COLORS[blockId] || '#fff';
                 el.style.backgroundImage = `url(${atlasInfo.canvas.toDataURL()})`;
                 el.style.backgroundSize = `${atlasInfo.COLS * 100}% ${atlasInfo.ROWS * 100}%`;
                 
-                // Calculate position for simple UI display (imperfect but works)
                 const props = BLOCK_MATS[blockId];
                 const atlasId = props.side || props.all || props.top || 0;
                 const col = atlasId % atlasInfo.COLS;
@@ -351,7 +389,7 @@
             });
 
             document.addEventListener('keydown', (e) => {
-                if(e.key >= '1' && e.key <= '8') {
+                if(e.key >= '1' && e.key <= '9') {
                     const idx = parseInt(e.key) - 1;
                     if (selector.children[idx]) selector.children[idx].click();
                 }
@@ -363,33 +401,74 @@
         function init() {
             scene = new THREE.Scene();
             scene.background = new THREE.Color(0x87CEEB);
-            scene.fog = new THREE.Fog(0x87CEEB, 20, (RENDER_DISTANCE * CHUNK_SIZE) - 5);
+            scene.fog = new THREE.Fog(0x87CEEB, 20, (RENDER_DISTANCE * CHUNK_SIZE) - 10);
 
             camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
             
-            renderer = new THREE.WebGLRenderer({ antialias: false });
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
             renderer.setSize(window.innerWidth, window.innerHeight);
             renderer.setPixelRatio(window.devicePixelRatio);
             renderer.shadowMap.enabled = true;
             renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+            renderer.toneMapping = THREE.ACESFilmicToneMapping;
+            renderer.toneMappingExposure = 1.0;
             document.body.appendChild(renderer.domElement);
 
-            const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+            // --- Optimized Reflection Probe ---
+            cubeRenderTarget = new THREE.WebGLCubeRenderTarget(64); 
+            cubeRenderTarget.texture.type = THREE.HalfFloatType;
+            cubeCamera = new THREE.CubeCamera(1, 300, cubeRenderTarget);
+            scene.environment = cubeRenderTarget.texture;
+
+            // --- Lighting ---
+            ambientLight = new THREE.AmbientLight(0xffffff, 0.3); // Brighter ambient
             scene.add(ambientLight);
 
-            const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
-            dirLight.position.set(50, 100, 50);
+            dirLight = new THREE.DirectionalLight(0xffffff, 2.0); 
             dirLight.castShadow = true;
-            dirLight.shadow.mapSize.width = 2048;
-            dirLight.shadow.mapSize.height = 2048;
+            dirLight.shadow.mapSize.width = 1024; 
+            dirLight.shadow.mapSize.height = 1024;
+            dirLight.shadow.camera.near = 0.5;
+            dirLight.shadow.camera.far = 500;
+            const d = SHADOW_SIZE;
+            dirLight.shadow.camera.left = -d;
+            dirLight.shadow.camera.right = d;
+            dirLight.shadow.camera.top = d;
+            dirLight.shadow.camera.bottom = -d;
+            dirLight.shadow.bias = -0.0005;
             scene.add(dirLight);
+
+            const sunGeo = new THREE.BoxGeometry(30, 30, 30);
+            const sunMat = new THREE.MeshBasicMaterial({ color: 0xffffaa, fog: false });
+            sunMesh = new THREE.Mesh(sunGeo, sunMat);
+            scene.add(sunMesh);
+
+            const moonGeo = new THREE.BoxGeometry(20, 20, 20);
+            const moonMat = new THREE.MeshBasicMaterial({ color: 0xffffff, fog: false });
+            moonMesh = new THREE.Mesh(moonGeo, moonMat);
+            scene.add(moonMesh);
 
             controls = new PointerLockControls(camera, document.body);
             
             const instructions = document.getElementById('instructions');
-            instructions.addEventListener('click', () => controls.lock());
-            controls.addEventListener('lock', () => instructions.style.display = 'none');
-            controls.addEventListener('unlock', () => instructions.style.display = 'block');
+            let isLocking = false; 
+
+            instructions.addEventListener('click', () => {
+                if (!isLocking) {
+                    isLocking = true;
+                    controls.lock();
+                }
+            });
+
+            controls.addEventListener('lock', () => {
+                instructions.style.display = 'none';
+                isLocking = false;
+            });
+
+            controls.addEventListener('unlock', () => {
+                instructions.style.display = 'block';
+                isLocking = false;
+            });
 
             noise2D = createNoise2D(() => Math.random());
             noise3D = createNoise3D(() => Math.random());
@@ -402,12 +481,84 @@
             document.addEventListener('mousedown', onMouseDown);
 
             updateChunks();
-            camera.position.set(0, 40, 0); 
+            
+            camera.position.set(0, 50, 0); 
+            scene.add(cubeCamera); 
 
             animate();
             window.addEventListener('resize', onWindowResize);
         }
 
+        // --- Sky Update Logic ---
+        function updateSky(dt) {
+            dayTime += dt / DAY_DURATION;
+            if (dayTime > 1) dayTime -= 1;
+
+            const angle = dayTime * Math.PI * 2;
+            const radius = 250; 
+
+            const cx = camera.position.x;
+            const cz = camera.position.z;
+
+            // Sun Orbit
+            sunMesh.position.x = cx + Math.cos(angle) * radius;
+            sunMesh.position.y = Math.sin(angle) * radius;
+            sunMesh.position.z = cz;
+            sunMesh.lookAt(cx, 0, cz);
+
+            // Moon Orbit
+            moonMesh.position.x = cx + Math.cos(angle + Math.PI) * radius;
+            moonMesh.position.y = Math.sin(angle + Math.PI) * radius;
+            moonMesh.position.z = cz;
+            moonMesh.lookAt(cx, 0, cz);
+
+            dirLight.position.copy(sunMesh.position);
+            dirLight.target.position.set(cx, 0, cz);
+            
+            const shadowMapSize = 1024;
+            const worldSize = SHADOW_SIZE * 2;
+            const texelSize = worldSize / shadowMapSize;
+            dirLight.position.x = Math.round(dirLight.position.x / texelSize) * texelSize;
+            dirLight.position.z = Math.round(dirLight.position.z / texelSize) * texelSize;
+            
+            const sinY = Math.sin(angle); 
+            
+            let sunlightColor = new THREE.Color();
+            let sunIntensity = 0;
+            
+            if (sinY > 0.2) {
+                currentSkyColor.setHex(0x87CEEB);
+                sunlightColor.setHex(0xffffff);
+                sunIntensity = 2.0;
+                document.getElementById('time-display').innerText = "Day";
+            } else if (sinY > -0.2) {
+                currentSkyColor.setHex(0xFF4500);
+                currentSkyColor.lerp(new THREE.Color(0x87CEEB), (sinY + 0.2) / 0.4);
+                sunlightColor.setHex(0xffaa00);
+                sunIntensity = 1.0;
+                document.getElementById('time-display').innerText = "Sunset/Sunrise";
+            } else {
+                currentSkyColor.setHex(0x050510);
+                sunlightColor.setHex(0x111111);
+                sunIntensity = 0.2; 
+                document.getElementById('time-display').innerText = "Night";
+            }
+
+            if (!isSwimming) {
+                scene.background.lerp(currentSkyColor, 0.1);
+                scene.fog.color.copy(scene.background);
+                scene.fog.near = 20;
+                scene.fog.far = (RENDER_DISTANCE * CHUNK_SIZE) - 10;
+            }
+
+            dirLight.intensity = Math.max(0.1, sunIntensity);
+            dirLight.color.lerp(sunlightColor, 0.1);
+            
+            const ambientTarget = sinY > 0 ? 0.3 : 0.25; // Brighter night ambient
+            ambientLight.intensity += (ambientTarget - ambientLight.intensity) * 0.05;
+        }
+
+        // --- Helper: Global Block Lookup (Crucial for Boundary Culling) ---
         function getBlockAt(x, y, z) {
             const cx = Math.floor(x / CHUNK_SIZE);
             const cz = Math.floor(z / CHUNK_SIZE);
@@ -436,9 +587,19 @@
 
             chunk.data[lx][Math.floor(y)][lz] = blockId;
             chunk.needsUpdate = true;
+            // Update neighbors if on boundary
+            if (lx === 0) updateChunk(cx - 1, cz);
+            if (lx === CHUNK_SIZE - 1) updateChunk(cx + 1, cz);
+            if (lz === 0) updateChunk(cx, cz - 1);
+            if (lz === CHUNK_SIZE - 1) updateChunk(cx, cz + 1);
         }
 
-        // --- Chunk Logic with Face Culling ---
+        function updateChunk(cx, cz) {
+            const key = `${cx},${cz}`;
+            if (chunks.has(key)) chunks.get(key).needsUpdate = true;
+        }
+
+        // --- Chunk Logic ---
 
         class Chunk {
             constructor(cx, cz) {
@@ -469,24 +630,26 @@
                         const n2 = noise2D(wx * 0.05, wz * 0.05) * 0.5;
                         const height = Math.floor((n + n2 + 1) * 10) + 10;
 
-                        for (let y = 0; y < height; y++) {
-                            let block = BLOCKS.STONE;
-                            if (y === height - 1) block = BLOCKS.GRASS;
-                            else if (y > height - 4) block = BLOCKS.DIRT;
-                            else if (y < 3) block = BLOCKS.STONE;
+                        for (let y = 0; y < CHUNK_HEIGHT; y++) {
+                            if (y < height) {
+                                let block = BLOCKS.STONE;
+                                if (y === height - 1) block = BLOCKS.GRASS;
+                                else if (y > height - 4) block = BLOCKS.DIRT;
+                                else if (y < 3) block = BLOCKS.STONE;
 
-                            if (y < height - 2) {
-                                const cave = noise3D(wx * 0.05, y * 0.05, wz * 0.05);
-                                if (cave > 0.4) block = BLOCKS.AIR;
+                                if (y < height - 2) {
+                                    const cave = noise3D(wx * 0.05, y * 0.05, wz * 0.05);
+                                    if (cave > 0.4) block = BLOCKS.AIR;
+                                }
+                                if (height < SEA_LEVEL + 2 && y === height - 1) block = BLOCKS.SAND;
+                                this.data[x][y][z] = block;
+                            } else if (y < SEA_LEVEL) {
+                                if (this.data[x][y][z] === BLOCKS.AIR) {
+                                    this.data[x][y][z] = BLOCKS.WATER;
+                                }
                             }
-                            if (height < 14) {
-                                if (y === height - 1) block = BLOCKS.SAND;
-                                if (y > height && y < 13) block = BLOCKS.WATER;
-                            }
-                            this.data[x][y][z] = block;
                         }
-                        // Simple trees
-                        if (height > 15 && Math.random() < 0.01 && this.data[x][height-1][z] === BLOCKS.GRASS) {
+                        if (height > SEA_LEVEL && Math.random() < 0.01 && this.data[x][height-1][z] === BLOCKS.GRASS) {
                             this.generateTree(x, height, z);
                         }
                     }
@@ -529,21 +692,25 @@
 
                 const COLS = 4;
                 const ROWS = 4;
-                // UV size for one tile
                 const US = 1 / COLS;
                 const VS = 1 / ROWS;
 
-                // Internal helper to check opacity
-                // Returns true if neighbor is transparent (meaning we should draw the face)
-                const isTransparent = (x, y, z) => {
-                    // Out of bounds check: Assume boundaries are drawn to be safe/simple
-                    if (x < 0 || x >= CHUNK_SIZE || y < 0 || y >= CHUNK_HEIGHT || z < 0 || z >= CHUNK_SIZE) {
-                        return true; 
-                    }
-                    const b = this.data[x][y][z];
-                    if (b === BLOCKS.AIR) return true;
-                    if (BLOCK_MATS[b] && BLOCK_MATS[b].transparent) return true;
+                // GLOBAL CHECK for boundary correctness
+                const checkGlobalTransparent = (lx, ly, lz) => {
+                    const wx = this.cx * CHUNK_SIZE + lx;
+                    const wz = this.cz * CHUNK_SIZE + lz;
+                    
+                    // Simple boundary check for y
+                    if (ly < 0 || ly >= CHUNK_HEIGHT) return true;
+
+                    const block = getBlockAt(wx, ly, wz);
+                    if (block === BLOCKS.AIR) return true;
+                    if (BLOCK_MATS[block] && BLOCK_MATS[block].transparent) return true;
                     return false;
+                };
+
+                const getGlobalBlock = (lx, ly, lz) => {
+                    return getBlockAt(this.cx * CHUNK_SIZE + lx, ly, this.cz * CHUNK_SIZE + lz);
                 };
 
                 for (let x = 0; x < CHUNK_SIZE; x++) {
@@ -554,73 +721,57 @@
 
                             const mats = BLOCK_MATS[block];
                             if (!mats) continue;
-
-                            // Directions: 
-                            // px (x+1), nx (x-1), py (y+1), ny (y-1), pz (z+1), nz (z-1)
                             
-                            // Check Right (PX)
-                            if (isTransparent(x + 1, y, z)) {
+                            // Face Culling Logic
+                            // If I am WATER, I only draw face if neighbor is NOT WATER and is Transparent
+                            // If neighbor is WATER, face is hidden.
+                            
+                            const shouldDraw = (dx, dy, dz) => {
+                                const neighborBlock = getGlobalBlock(x + dx, y + dy, z + dz);
+                                if (block === BLOCKS.WATER && neighborBlock === BLOCKS.WATER) return false;
+                                // If neighbor is transparent (Air, Leaves, Water), we usually draw.
+                                // But if neighbor is solid, we don't draw.
+                                
+                                const neighborMat = BLOCK_MATS[neighborBlock];
+                                const isNeighborTransparent = (neighborBlock === BLOCKS.AIR) || (neighborMat && neighborMat.transparent);
+                                
+                                return isNeighborTransparent;
+                            };
+
+                            if (shouldDraw(1, 0, 0)) {
                                 const atlasId = mats.side !== undefined ? mats.side : (mats.all || 0);
-                                this.addFace(positions, normals, uvs, indices, indexOffset, 
-                                    [x+1, y, z+1], [x+1, y, z], [x+1, y+1, z], [x+1, y+1, z+1], // Verts
-                                    [1, 0, 0], // Normal
-                                    atlasId, US, VS
-                                );
+                                this.addFace(positions, normals, uvs, indices, indexOffset,
+                                    [x+1, y, z+1], [x+1, y, z], [x+1, y+1, z], [x+1, y+1, z+1], [1, 0, 0], atlasId, US, VS);
                                 indexOffset += 4;
                             }
-
-                            // Check Left (NX)
-                            if (isTransparent(x - 1, y, z)) {
+                            if (shouldDraw(-1, 0, 0)) {
                                 const atlasId = mats.side !== undefined ? mats.side : (mats.all || 0);
-                                this.addFace(positions, normals, uvs, indices, indexOffset, 
-                                    [x, y, z], [x, y, z+1], [x, y+1, z+1], [x, y+1, z],
-                                    [-1, 0, 0],
-                                    atlasId, US, VS
-                                );
+                                this.addFace(positions, normals, uvs, indices, indexOffset,
+                                    [x, y, z], [x, y, z+1], [x, y+1, z+1], [x, y+1, z], [-1, 0, 0], atlasId, US, VS);
                                 indexOffset += 4;
                             }
-
-                            // Check Top (PY)
-                            if (isTransparent(x, y + 1, z)) {
+                            if (shouldDraw(0, 1, 0)) {
                                 const atlasId = mats.top !== undefined ? mats.top : (mats.all || 0);
-                                this.addFace(positions, normals, uvs, indices, indexOffset, 
-                                    [x, y+1, z+1], [x+1, y+1, z+1], [x+1, y+1, z], [x, y+1, z],
-                                    [0, 1, 0],
-                                    atlasId, US, VS
-                                );
+                                this.addFace(positions, normals, uvs, indices, indexOffset,
+                                    [x, y+1, z+1], [x+1, y+1, z+1], [x+1, y+1, z], [x, y+1, z], [0, 1, 0], atlasId, US, VS);
                                 indexOffset += 4;
                             }
-
-                            // Check Bottom (NY)
-                            if (isTransparent(x, y - 1, z)) {
+                            if (shouldDraw(0, -1, 0)) {
                                 const atlasId = mats.bottom !== undefined ? mats.bottom : (mats.all || 0);
-                                this.addFace(positions, normals, uvs, indices, indexOffset, 
-                                    [x, y, z], [x+1, y, z], [x+1, y, z+1], [x, y, z+1],
-                                    [0, -1, 0],
-                                    atlasId, US, VS
-                                );
+                                this.addFace(positions, normals, uvs, indices, indexOffset,
+                                    [x, y, z], [x+1, y, z], [x+1, y, z+1], [x, y, z+1], [0, -1, 0], atlasId, US, VS);
                                 indexOffset += 4;
                             }
-
-                            // Check Front (PZ)
-                            if (isTransparent(x, y, z + 1)) {
+                            if (shouldDraw(0, 0, 1)) {
                                 const atlasId = mats.side !== undefined ? mats.side : (mats.all || 0);
-                                this.addFace(positions, normals, uvs, indices, indexOffset, 
-                                    [x+1, y, z+1], [x, y, z+1], [x, y+1, z+1], [x+1, y+1, z+1],
-                                    [0, 0, 1],
-                                    atlasId, US, VS
-                                );
+                                this.addFace(positions, normals, uvs, indices, indexOffset,
+                                    [x+1, y, z+1], [x, y, z+1], [x, y+1, z+1], [x+1, y+1, z+1], [0, 0, 1], atlasId, US, VS);
                                 indexOffset += 4;
                             }
-
-                            // Check Back (NZ)
-                            if (isTransparent(x, y, z - 1)) {
+                            if (shouldDraw(0, 0, -1)) {
                                 const atlasId = mats.side !== undefined ? mats.side : (mats.all || 0);
-                                this.addFace(positions, normals, uvs, indices, indexOffset, 
-                                    [x, y, z], [x+1, y, z], [x+1, y+1, z], [x, y+1, z],
-                                    [0, 0, -1],
-                                    atlasId, US, VS
-                                );
+                                this.addFace(positions, normals, uvs, indices, indexOffset,
+                                    [x+1, y, z], [x, y, z], [x, y+1, z], [x+1, y+1, z], [0, 0, -1], atlasId, US, VS);
                                 indexOffset += 4;
                             }
                         }
@@ -634,60 +785,40 @@
                 geometry.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(normals), 3));
                 geometry.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(uvs), 2));
                 geometry.setIndex(indices);
+                geometry.setAttribute('uv2', new THREE.BufferAttribute(new Float32Array(uvs), 2));
 
                 this.mesh = new THREE.Mesh(geometry, atlasMaterial);
                 this.mesh.position.set(this.cx * CHUNK_SIZE, 0, this.cz * CHUNK_SIZE);
                 this.mesh.castShadow = true;
                 this.mesh.receiveShadow = true;
-                this.mesh.userData = { chunk: this };
+                this.mesh.matrixAutoUpdate = false;
+                this.mesh.updateMatrix();
                 
+                this.mesh.userData = { chunk: this };
                 scene.add(this.mesh);
                 this.needsUpdate = false;
             }
 
-            addFace(pos, norm, uv, idx, offset, vert1, vert2, vert3, vert4, n, atlasId, US, VS) {
-                // Vertices
-                pos.push(...vert1, ...vert2, ...vert3, ...vert4);
-                
-                // Normals
+            addFace(pos, norm, uv, idx, offset, bl, br, tr, tl, n, atlasId, US, VS) {
+                pos.push(...bl, ...br, ...tr, ...tl);
                 norm.push(...n, ...n, ...n, ...n);
 
-                // UVs
-                // Calculate Atlas UV coordinates
-                // atlasId -> col, row
-                // In ThreeJS UVs, (0,0) is bottom-left.
-                // Our drawing code draws 0 at top-left.
-                // We need to flip Y for UVs or calculation.
-                // Standard CanvasTexture: (0,1) is Top-Left visually if using default map.
-                // Let's assume standard UV grid: (0,0) bottom-left.
-                // COLS=4, ROWS=4.
-                // ID 0 (Top Left) -> Col 0, Row 3 (in UV space)
-                
                 const col = atlasId % 4;
-                const row = 3 - Math.floor(atlasId / 4); // Flip row for UV
+                const row = 3 - Math.floor(atlasId / 4);
 
                 const u0 = col * US;
                 const v0 = row * VS;
                 const u1 = (col + 1) * US;
                 const v1 = (row + 1) * VS;
-                
-                // Add tiny padding to prevent texture bleeding
                 const p = 0.001; 
 
-                // Mapping for quad:
-                // v1 (Bottom Right relative to face?), v2 (Bottom Left), v3 (Top Left), v4 (Top Right)
-                // Order passed is usually Counter Clockwise:
-                // e.g. Right Face: (x+1, y, z+1), (x+1, y, z), (x+1, y+1, z), (x+1, y+1, z+1)
-                // This corresponds to: Bottom Right, Bottom Left, Top Left, Top Right relative to looking at face
-                
-                uv.push(u1-p, v0+p); // vert1
-                uv.push(u0+p, v0+p); // vert2
-                uv.push(u0+p, v1-p); // vert3
-                uv.push(u1-p, v1-p); // vert4
+                uv.push(u0+p, v0+p); // BL
+                uv.push(u1-p, v0+p); // BR
+                uv.push(u1-p, v1-p); // TR
+                uv.push(u0+p, v1-p); // TL
 
-                // Indices (Two triangles: 0,1,2 and 0,2,3 relative to offset)
-                idx.push(offset, offset + 1, offset + 2);
-                idx.push(offset, offset + 2, offset + 3);
+                idx.push(offset, offset + 1, offset + 2); 
+                idx.push(offset, offset + 2, offset + 3); 
             }
         }
 
@@ -734,15 +865,57 @@
             document.getElementById('chunks-loaded').innerText = chunks.size;
         }
 
-        // --- Physics & Collision ---
+        // --- Physics & Swimming ---
+
+        const keysPressed = {};
+        document.addEventListener('keydown', (e) => keysPressed[e.code] = true);
+        document.addEventListener('keyup', (e) => keysPressed[e.code] = false);
 
         function updatePhysics(dt) {
             if (!controls.isLocked) return;
 
-            const speed = 10;
+            // Check if head is inside water
+            const eyeX = Math.floor(camera.position.x);
+            const eyeY = Math.floor(camera.position.y);
+            const eyeZ = Math.floor(camera.position.z);
+            
+            const headBlock = getBlockAt(eyeX, eyeY, eyeZ);
+            
+            // Check if feet are in water (for getting out)
+            const feetY = Math.floor(camera.position.y - 1.5);
+            const feetBlock = getBlockAt(eyeX, feetY, eyeZ);
+            
+            isSwimming = (headBlock === BLOCKS.WATER);
+            const bodyInWater = (feetBlock === BLOCKS.WATER);
+
+            // Underwater Effects
+            if (isSwimming) {
+                scene.fog.color.setHex(0x001e40); // Dark Blue Fog
+                scene.fog.near = 0.1;
+                scene.fog.far = 10; // Thick fog
+                document.getElementById('state-display').innerText = "Swimming";
+            } else {
+                document.getElementById('state-display').innerText = "Walking";
+            }
+
+            // Movement logic
+            const speed = isSwimming ? 3 : 10; // Much slower in water
             const gravity = 30;
 
-            playerVelocity.y -= gravity * dt;
+            // Buoyancy Logic
+            if (isSwimming || bodyInWater) {
+                // If swimming or wading, gravity is reduced or reversed if holding space
+                if (keysPressed['Space']) {
+                    playerVelocity.y = 5; // Swim Up
+                } else {
+                    // Slowly sink if not holding space
+                    playerVelocity.y -= gravity * dt * 0.2; 
+                    if(playerVelocity.y < -2) playerVelocity.y = -2;
+                }
+            } else {
+                // Normal air gravity
+                playerVelocity.y -= gravity * dt;
+            }
 
             const forward = new THREE.Vector3();
             const right = new THREE.Vector3();
@@ -805,8 +978,8 @@
                 for (let iy = minY; iy <= maxY; iy++) {
                     for (let iz = minZ; iz <= maxZ; iz++) {
                         const block = getBlockAt(ix, iy, iz);
+                        // Collision checks ignore WATER and AIR
                         if (block !== BLOCKS.AIR && block !== BLOCKS.WATER) {
-                            // Precise AABB check could go here, but grid check is okay for simple demo
                             return true;
                         }
                     }
@@ -821,39 +994,50 @@
             if (!controls.isLocked) return;
 
             raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
-
-            // Raycast against all chunk meshes
             const meshes = [];
             for(const c of chunks.values()) if(c.mesh) meshes.push(c.mesh);
-
             const intersects = raycaster.intersectObjects(meshes);
 
             if (intersects.length > 0) {
                 const hit = intersects[0];
-                // hit.point is on the face. Add small epsilon to get inside/outside block
-                
                 const p = hit.point;
                 const n = hit.face.normal;
                 
-                // Position of the block we hit (move slightly into the block)
                 const breakPos = p.clone().add(n.clone().multiplyScalar(-0.1));
                 const bx = Math.floor(breakPos.x);
                 const by = Math.floor(breakPos.y);
                 const bz = Math.floor(breakPos.z);
 
-                // Position of the new block (move slightly out)
                 const placePos = p.clone().add(n.clone().multiplyScalar(0.1));
                 const px = Math.floor(placePos.x);
                 const py = Math.floor(placePos.y);
                 const pz = Math.floor(placePos.z);
 
                 if (event.button === 0) {
+                    const targetBlock = getBlockAt(bx, by, bz);
+                    if (targetBlock === BLOCKS.WATER) return; // Cant break water
+
                     setBlockAt(bx, by, bz, BLOCKS.AIR);
                     updateChunkAndNeighbors(bx, by, bz);
                 } else if (event.button === 2) {
-                    // Check intersection with player
-                    const pDist = new THREE.Vector3(px+0.5, py, pz+0.5).distanceTo(camera.position);
-                    if(pDist > 1.2 || py < camera.position.y - 1.6) {
+                    const playerR = 0.3;
+                    const playerH = 1.8;
+                    const pMinX = camera.position.x - playerR;
+                    const pMaxX = camera.position.x + playerR;
+                    const pMinY = camera.position.y - 1.6;
+                    const pMaxY = camera.position.y - 1.6 + playerH;
+                    const pMinZ = camera.position.z - playerR;
+                    const pMaxZ = camera.position.z + playerR;
+                    const bMinX = px;
+                    const bMaxX = px + 1;
+                    const bMinY = py;
+                    const bMaxY = py + 1;
+                    const bMinZ = pz;
+                    const bMaxZ = pz + 1;
+                    const intersect = (pMinX < bMaxX && pMaxX > bMinX) &&
+                                      (pMinY < bMaxY && pMaxY > bMinY) &&
+                                      (pMinZ < bMaxZ && pMaxZ > bMinZ);
+                    if (!intersect) {
                          setBlockAt(px, py, pz, selectedBlock);
                          updateChunkAndNeighbors(px, py, pz);
                     }
@@ -866,17 +1050,15 @@
                 const key = `${cx},${cz}`;
                 if (chunks.has(key)) chunks.get(key).buildMesh();
             };
-            
             const cx = Math.floor(x / CHUNK_SIZE);
             const cz = Math.floor(z / CHUNK_SIZE);
             
+            // Rebuild center and all neighbors to ensure water faces update correctly
             update(cx, cz);
-            
-            // Check boundaries
-            if ((x % CHUNK_SIZE) === 0) update(cx - 1, cz);
-            if ((x % CHUNK_SIZE) === CHUNK_SIZE - 1) update(cx + 1, cz);
-            if ((z % CHUNK_SIZE) === 0) update(cx, cz - 1);
-            if ((z % CHUNK_SIZE) === CHUNK_SIZE - 1) update(cx, cz + 1);
+            update(cx - 1, cz);
+            update(cx + 1, cz);
+            update(cx, cz - 1);
+            update(cx, cz + 1);
         }
 
         const moveState = { forward: false, backward: false, left: false, right: false };
@@ -887,7 +1069,9 @@
                 case 'KeyA': moveState.left = true; break;
                 case 'KeyS': moveState.backward = true; break;
                 case 'KeyD': moveState.right = true; break;
-                case 'Space': if (canJump) playerVelocity.y = 12; canJump = false; break;
+                case 'Space': 
+                    if (canJump && !isSwimming) { playerVelocity.y = 12; canJump = false; }
+                    break;
             }
         });
 
@@ -921,7 +1105,15 @@
             const stepDelta = delta / steps;
             for(let i=0; i<steps; i++) updatePhysics(stepDelta);
 
+            updateSky(delta);
             updateChunks();
+            
+            // --- Optimized Reflection Update (Every 5 Frames) ---
+            reflectionUpdateCounter++;
+            if (cubeCamera && reflectionUpdateCounter % 5 === 0) {
+                cubeCamera.position.copy(camera.position);
+                cubeCamera.update(renderer, scene);
+            }
 
             renderer.render(scene, camera);
 
