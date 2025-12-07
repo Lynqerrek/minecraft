@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Minecraft: Amplified + Big Biomes</title>
+    <title>Minecraft: Geometric + Texture LOD</title>
     <style>
         body { margin: 0; overflow: hidden; background-color: #87CEEB; font-family: 'Segoe UI', sans-serif; }
         
@@ -68,13 +68,14 @@
     <div id="crosshair"></div>
     <div id="ui">
         <b>WASD</b> Move | <b>SPACE</b> Jump | <b>ESC</b> Settings<br>
-        FPS: <span id="fps">0</span> | Chunks: <span id="chunks">0</span> | Queue: <span id="queue">0</span>
+        FPS: <span id="fps">0</span> | Chunks: <span id="chunks">0</span> | Queue: <span id="queue">0</span><br>
+        LOD Updates: <span id="lodUpdates">0</span>
     </div>
     <div id="menu">
         <h1>PAUSED</h1>
         <div class="menu-item">
             <label for="distSlider">Render Distance: <span id="distVal">5</span></label><br>
-            <input type="range" id="distSlider" min="2" max="88" value="5" step="1">
+            <input type="range" id="distSlider" min="2" max="20" value="5" step="1">
         </div>
         <div class="menu-item">
             <button class="btn" id="resumeBtn">RESUME</button>
@@ -95,8 +96,12 @@
         // Terrain Gen Settings
         const NOISE_SCALE = 0.0015; 
         const AMP_HEIGHT = 140;     
-        const BASE_HEIGHT = 50;     
-
+        const BASE_HEIGHT = 50;
+        
+        // LOD Settings
+        const LOD_RATIO = 0.3; // Distance ratio where LOD kicks in
+        const LOD_STEP_FAR = 2; // Geometric step for far chunks (2x2x2 blocks become one big block)
+        
         // --- GLOBAL VARIABLES ---
         let camera, scene, renderer, controls;
         const chunks = new Map();
@@ -111,14 +116,11 @@
         
         // Optimization: Throttling & Caching
         let chunkQueue = []; 
+        let chunkUpdateQueue = []; 
         let lastChunkCheckX = -9999;
         let lastChunkCheckZ = -9999;
         
-        // Smart Cache for physics to avoid Map lookups
-        const chunkCache = {
-            key: '',
-            chunk: null
-        };
+        const chunkCache = { key: '', chunk: null };
 
         const raycaster = new THREE.Raycaster();
         const _tempVec3 = new THREE.Vector3();
@@ -142,13 +144,14 @@
             { color: '#4a8a3a', name: 'Leaves', transparent: true }, 
             { color: '#dccfa3', name: 'Planks' } 
         ];
+        // Total number of block types excluding AIR
+        const BLOCK_TYPE_COUNT = BLOCK_PROPS.length;
 
         let selectedBlock = BLOCKS.GRASS;
 
-        // --- TEXTURES (Generated 8x8 Pixel Art) ---
-        function createTextureAtlas() {
+        // --- TEXTURES (Variable Size Atlas) ---
+        function createTextureAtlas(size, isLowRes = false) {
             const canvas = document.createElement('canvas');
-            const size = 8; 
             canvas.width = size * (BLOCK_PROPS.length - 1);
             canvas.height = size;
             const ctx = canvas.getContext('2d');
@@ -157,36 +160,38 @@
                 if (!block) return;
                 const x = (i - 1) * size;
                 
-                // Base Color
+                // 1. Fill base color (Dominant/1x1 color)
                 ctx.fillStyle = block.color;
                 ctx.fillRect(x, 0, size, size);
                 
-                // Patterns
-                if (block.name === 'Grass') {
-                    ctx.fillStyle = '#8ce870'; 
-                    ctx.fillRect(x + 1, 1, 2, 1); ctx.fillRect(x + 5, 2, 1, 1); ctx.fillRect(x + 2, 6, 1, 1);
-                    ctx.fillStyle = '#4fa132'; ctx.fillRect(x + 1, 7, 6, 1); 
-                } 
-                else if (block.name === 'Dirt') {
-                    ctx.fillStyle = '#6b4a34'; 
-                    ctx.fillRect(x + 1, 1, 1, 1); ctx.fillRect(x + 5, 2, 1, 1);
-                    ctx.fillRect(x + 2, 6, 1, 1); ctx.fillRect(x + 6, 5, 1, 1);
-                } 
-                else if (block.name === 'Stone') {
-                    ctx.fillStyle = '#757575'; ctx.fillRect(x, 0, size, 1); ctx.fillRect(x, 0, 1, size); 
-                    ctx.fillStyle = '#a8a8a8'; ctx.fillRect(x + 2, 2, 1, 1);
-                } 
-                else if (block.name === 'Log') {
-                    ctx.fillStyle = '#4a332a'; ctx.fillRect(x + 2, 0, 1, 8); ctx.fillRect(x + 5, 0, 1, 8);
-                } 
-                else if (block.name === 'Leaves') {
-                    ctx.fillStyle = '#3a6e2e'; ctx.fillRect(x + 1, 1, 2, 2); ctx.fillRect(x + 5, 5, 2, 2);
-                    ctx.fillStyle = '#5cb849'; ctx.fillRect(x + 5, 1, 1, 1); ctx.fillRect(x + 2, 6, 1, 1);
-                } 
-                else if (block.name === 'Planks') {
-                    ctx.fillStyle = '#bfae82'; 
-                    ctx.fillRect(x, 0, size, 1); ctx.fillRect(x, 4, size, 1); 
-                    ctx.fillRect(x + 3, 1, 1, 3); ctx.fillRect(x + 5, 5, 1, 3); 
+                // 2. Add patterns ONLY for the high-res 8x8 texture
+                if (size >= 8) {
+                    if (block.name === 'Grass') {
+                        ctx.fillStyle = '#8ce870'; 
+                        ctx.fillRect(x + 1, 1, 2, 1); ctx.fillRect(x + 5, 2, 1, 1); ctx.fillRect(x + 2, 6, 1, 1);
+                        ctx.fillStyle = '#4fa132'; ctx.fillRect(x + 1, 7, 6, 1); 
+                    } 
+                    else if (block.name === 'Dirt') {
+                        ctx.fillStyle = '#6b4a34'; 
+                        ctx.fillRect(x + 1, 1, 1, 1); ctx.fillRect(x + 5, 2, 1, 1);
+                        ctx.fillRect(x + 2, 6, 1, 1); ctx.fillRect(x + 6, 5, 1, 1);
+                    } 
+                    else if (block.name === 'Stone') {
+                        ctx.fillStyle = '#757575'; ctx.fillRect(x, 0, size, 1); ctx.fillRect(x, 0, 1, size); 
+                        ctx.fillStyle = '#a8a8a8'; ctx.fillRect(x + 2, 2, 1, 1);
+                    } 
+                    else if (block.name === 'Log') {
+                        ctx.fillStyle = '#4a332a'; ctx.fillRect(x + 2, 0, 1, 8); ctx.fillRect(x + 5, 0, 1, 8);
+                    } 
+                    else if (block.name === 'Leaves') {
+                        ctx.fillStyle = '#3a6e2e'; ctx.fillRect(x + 1, 1, 2, 2); ctx.fillRect(x + 5, 5, 2, 2);
+                        ctx.fillStyle = '#5cb849'; ctx.fillRect(x + 5, 1, 1, 1); ctx.fillRect(x + 2, 6, 1, 1);
+                    } 
+                    else if (block.name === 'Planks') {
+                        ctx.fillStyle = '#bfae82'; 
+                        ctx.fillRect(x, 0, size, 1); ctx.fillRect(x, 4, size, 1); 
+                        ctx.fillRect(x + 3, 1, 1, 3); ctx.fillRect(x + 5, 5, 1, 3); 
+                    }
                 }
             });
 
@@ -197,9 +202,17 @@
             return tex;
         }
 
-        const atlasTexture = createTextureAtlas();
-        const chunkMaterial = new THREE.MeshBasicMaterial({ 
-            map: atlasTexture,
+        const atlasHigh = createTextureAtlas(8, false);
+        const atlasLow = createTextureAtlas(1, false); 
+
+        const materialHigh = new THREE.MeshBasicMaterial({ 
+            map: atlasHigh,
+            vertexColors: true,
+            side: THREE.DoubleSide
+        });
+        
+        const materialLow = new THREE.MeshBasicMaterial({ 
+            map: atlasLow,
             vertexColors: true,
             side: THREE.DoubleSide
         });
@@ -233,7 +246,10 @@
                 distVal.innerText = renderDistance;
                 updateFog();
                 lastChunkCheckX = -9999; 
-                chunkQueue = []; // Clear queue on settings change
+                chunkQueue = []; 
+                chunkUpdateQueue = [];
+                chunks.forEach(c => { if(c.mesh) { scene.remove(c.mesh); c.mesh.geometry.dispose(); }});
+                chunks.clear();
             });
             
             document.addEventListener('keydown', onKeyDown);
@@ -250,7 +266,7 @@
         }
 
         function updateFog() {
-            scene.fog = new THREE.Fog(0x87CEEB, (renderDistance - 1) * CHUNK_SIZE, (renderDistance + 1) * CHUNK_SIZE);
+            scene.fog = new THREE.Fog(0x87CEEB, (renderDistance - 1.5) * CHUNK_SIZE, (renderDistance) * CHUNK_SIZE);
         }
 
         function setupHotbar() {
@@ -315,6 +331,7 @@
                 this.cz = cz;
                 this.data = new Uint8Array(CHUNK_SIZE * CHUNK_SIZE * WORLD_HEIGHT);
                 this.mesh = null;
+                this.lod = 1; 
                 this.generate();
             }
 
@@ -369,72 +386,111 @@
 
                 const numTypes = BLOCK_PROPS.length - 1;
                 const uvStep = 1 / numTypes;
-                const data = this.data;
                 const chunkCX = this.cx * CHUNK_SIZE;
                 const chunkCZ = this.cz * CHUNK_SIZE;
+                
+                const step = this.lod; 
 
-                // SMART OPTIMIZATION: Pre-fetch neighbors
+                // Neighbors
                 const nPX = chunks.get(`${this.cx+1},${this.cz}`);
                 const nNX = chunks.get(`${this.cx-1},${this.cz}`);
                 const nPZ = chunks.get(`${this.cx},${this.cz+1}`);
                 const nNZ = chunks.get(`${this.cx},${this.cz-1}`);
 
-                for (let y = 0; y < WORLD_HEIGHT; y++) {
-                    for (let x = 0; x < CHUNK_SIZE; x++) {
-                        for (let z = 0; z < CHUNK_SIZE; z++) {
-                            const block = data[x + CHUNK_SIZE * (z + CHUNK_SIZE * y)];
+                // Helper: Get best block for a volume (LOD Support)
+                const getVolumeBlock = (lx, ly, lz) => {
+                    if (step === 1) return this.getBlock(lx, ly, lz);
+
+                    // Count block types in the volume (step x step x step)
+                    const counts = new Uint8Array(BLOCK_TYPE_COUNT).fill(0);
+                    let maxCount = 0;
+                    let dominantBlock = 0;
+                    
+                    for (let dx = 0; dx < step; dx++) {
+                        for (let dy = 0; dy < step; dy++) {
+                            for (let dz = 0; dz < step; dz++) {
+                                const b = this.getBlock(lx+dx, ly+dy, lz+dz);
+                                
+                                if (b !== BLOCKS.AIR) {
+                                    counts[b]++;
+                                    if (counts[b] > maxCount) {
+                                        maxCount = counts[b];
+                                        dominantBlock = b;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return dominantBlock; 
+                };
+
+                // Helper: Check neighborhood for visibility
+                const isNeighborVolumeSolid = (cx, cy, cz) => {
+                    if (step === 1) {
+                         // Standard visibility check for LOD 1
+                         const b = this.getBlock(cx, cy, cz);
+                         return b !== 0 && !BLOCK_PROPS[b].transparent;
+                    }
+                    
+                    let targetChunk = this;
+                    let lx = cx; let ly = cy; let lz = cz;
+
+                    // Handle Boundaries
+                    if (lx < 0) { targetChunk = nNX; lx += CHUNK_SIZE; }
+                    else if (lx >= CHUNK_SIZE) { targetChunk = nPX; lx -= CHUNK_SIZE; }
+                    else if (lz < 0) { targetChunk = nNZ; lz += CHUNK_SIZE; }
+                    else if (lz >= CHUNK_SIZE) { targetChunk = nPZ; lz -= CHUNK_SIZE; }
+                    
+                    if (!targetChunk) return false; 
+
+                    // Scan the volume in the neighbor (step x step x step area)
+                    for (let dx = 0; dx < step; dx++) {
+                        for (let dy = 0; dy < step; dy++) {
+                            for (let dz = 0; dz < step; dz++) {
+                                if (ly + dy >= WORLD_HEIGHT || ly + dy < 0) return false; 
+
+                                const b = targetChunk.getBlock(lx+dx, ly+dy, lz+dz);
+                                if (b === 0 || (BLOCK_PROPS[b] && BLOCK_PROPS[b].transparent)) {
+                                    return false; // Found a non-solid block (Air/Leaves), so the face is VISIBLE
+                                }
+                            }
+                        }
+                    }
+                    return true; // Entire neighboring volume is solid, so face is hidden
+                };
+                
+                
+                for (let y = 0; y < WORLD_HEIGHT; y += step) {
+                    for (let x = 0; x < CHUNK_SIZE; x += step) {
+                        for (let z = 0; z < CHUNK_SIZE; z += step) {
+                            
+                            const block = getVolumeBlock(x, y, z);
                             if (block === 0) continue;
 
                             for (let i = 0; i < 6; i++) {
-                                const dx = DIRS[i][0];
-                                const dy = DIRS[i][1];
-                                const dz = DIRS[i][2];
-                                const nx = x + dx; const ny = y + dy; const nz = z + dz;
+                                const dx = DIRS[i][0] * step;
+                                const dy = DIRS[i][1] * step;
+                                const dz = DIRS[i][2] * step;
                                 
-                                let visible = false;
+                                const nx = x + dx; 
+                                const ny = y + dy; 
+                                const nz = z + dz;
                                 
-                                // Internal check
-                                if (nx >= 0 && nx < CHUNK_SIZE && nz >= 0 && nz < CHUNK_SIZE) {
-                                     if (ny >= 0 && ny < WORLD_HEIGHT) {
-                                        const nb = data[nx + CHUNK_SIZE * (nz + CHUNK_SIZE * ny)];
-                                        if (nb === 0 || BLOCK_PROPS[nb].transparent) visible = true;
-                                     } else {
-                                         visible = true; // Map limit
-                                     }
-                                } else {
-                                    // Boundary check using pre-fetched neighbor chunks
-                                    // This avoids isSolidGlobal map lookups inside the loop
-                                    let nb = 0;
-                                    let neighbor = null;
-                                    
-                                    if (nx < 0) neighbor = nNX;
-                                    else if (nx >= CHUNK_SIZE) neighbor = nPX;
-                                    else if (nz < 0) neighbor = nNZ;
-                                    else if (nz >= CHUNK_SIZE) neighbor = nPZ;
-                                    
-                                    if (neighbor) {
-                                        // Adjust coords for neighbor lookup (wrapping)
-                                        const lx = (nx + CHUNK_SIZE) % CHUNK_SIZE;
-                                        const lz = (nz + CHUNK_SIZE) % CHUNK_SIZE;
-                                        nb = neighbor.getBlock(lx, ny, lz);
-                                    }
-                                    
-                                    if (nb === 0 || BLOCK_PROPS[nb].transparent) visible = true;
-                                }
-
-                                if (visible) {
+                                // Face is visible if the neighboring volume is NOT solid
+                                if (!isNeighborVolumeSolid(nx, ny, nz)) {
                                     if (vIdx + 18 >= MAX_GEOM_SIZE * 3) break; 
                                     const vOffset = i * 12;
                                     const b = FACE_BRIGHTNESS[i];
                                     const u0 = (block - 1) * uvStep;
                                     const u1 = u0 + uvStep;
 
-                                    scratchPos[vIdx++] = x + BOX_POS[vOffset];   scratchPos[vIdx++] = y + BOX_POS[vOffset+1];   scratchPos[vIdx++] = z + BOX_POS[vOffset+2];
-                                    scratchPos[vIdx++] = x + BOX_POS[vOffset+3]; scratchPos[vIdx++] = y + BOX_POS[vOffset+4]; scratchPos[vIdx++] = z + BOX_POS[vOffset+5];
-                                    scratchPos[vIdx++] = x + BOX_POS[vOffset+6]; scratchPos[vIdx++] = y + BOX_POS[vOffset+7]; scratchPos[vIdx++] = z + BOX_POS[vOffset+8];
-                                    scratchPos[vIdx++] = x + BOX_POS[vOffset];   scratchPos[vIdx++] = y + BOX_POS[vOffset+1];   scratchPos[vIdx++] = z + BOX_POS[vOffset+2];
-                                    scratchPos[vIdx++] = x + BOX_POS[vOffset+6]; scratchPos[vIdx++] = y + BOX_POS[vOffset+7]; scratchPos[vIdx++] = z + BOX_POS[vOffset+8];
-                                    scratchPos[vIdx++] = x + BOX_POS[vOffset+9]; scratchPos[vIdx++] = y + BOX_POS[vOffset+10]; scratchPos[vIdx++] = z + BOX_POS[vOffset+11];
+                                    // Vertices scaled by 'step'
+                                    scratchPos[vIdx++] = x + BOX_POS[vOffset] * step;   scratchPos[vIdx++] = y + BOX_POS[vOffset+1] * step;   scratchPos[vIdx++] = z + BOX_POS[vOffset+2] * step;
+                                    scratchPos[vIdx++] = x + BOX_POS[vOffset+3] * step; scratchPos[vIdx++] = y + BOX_POS[vOffset+4] * step; scratchPos[vIdx++] = z + BOX_POS[vOffset+5] * step;
+                                    scratchPos[vIdx++] = x + BOX_POS[vOffset+6] * step; scratchPos[vIdx++] = y + BOX_POS[vOffset+7] * step; scratchPos[vIdx++] = z + BOX_POS[vOffset+8] * step;
+                                    scratchPos[vIdx++] = x + BOX_POS[vOffset] * step;   scratchPos[vIdx++] = y + BOX_POS[vOffset+1] * step;   scratchPos[vIdx++] = z + BOX_POS[vOffset+2] * step;
+                                    scratchPos[vIdx++] = x + BOX_POS[vOffset+6] * step; scratchPos[vIdx++] = y + BOX_POS[vOffset+7] * step; scratchPos[vIdx++] = z + BOX_POS[vOffset+8] * step;
+                                    scratchPos[vIdx++] = x + BOX_POS[vOffset+9] * step; scratchPos[vIdx++] = y + BOX_POS[vOffset+10] * step; scratchPos[vIdx++] = z + BOX_POS[vOffset+11] * step;
 
                                     for(let k=0; k<18; k++) scratchCol[cIdx++] = b;
 
@@ -450,14 +506,15 @@
                     }
                 }
 
-                // Slice creates a copy, which is necessary to avoid overwriting.
-                // This copy is the fastest way to get data to GPU in standard Three.js
                 const geometry = new THREE.BufferGeometry();
                 geometry.setAttribute('position', new THREE.BufferAttribute(scratchPos.slice(0, vIdx), 3));
                 geometry.setAttribute('uv', new THREE.BufferAttribute(scratchUV.slice(0, uIdx), 2));
                 geometry.setAttribute('color', new THREE.BufferAttribute(scratchCol.slice(0, cIdx), 3));
                 
-                this.mesh = new THREE.Mesh(geometry, chunkMaterial);
+                // Select Material based on LOD
+                const mat = this.lod === 1 ? materialHigh : materialLow;
+
+                this.mesh = new THREE.Mesh(geometry, mat);
                 this.mesh.position.set(chunkCX, 0, chunkCZ);
                 this.mesh.matrixAutoUpdate = false; 
                 this.mesh.updateMatrix();
@@ -467,14 +524,9 @@
 
         // --- GLOBAL WORLD HELPERS WITH CACHE ---
         
-        // Smart Chunk Lookup (Used primarily by physics)
         function getChunk(cx, cz) {
             const key = `${cx},${cz}`;
-            // Cache Hit
-            if (chunkCache.key === key) {
-                return chunkCache.chunk;
-            }
-            // Cache Miss
+            if (chunkCache.key === key) return chunkCache.chunk;
             const chunk = chunks.get(key);
             if (chunk) {
                 chunkCache.key = key;
@@ -483,12 +535,11 @@
             return chunk;
         }
 
-        // Physics Solidity Check - Treats all blocks as collidable
         function isCollidableGlobal(x, y, z) {
             const cx = Math.floor(x / CHUNK_SIZE);
             const cz = Math.floor(z / CHUNK_SIZE);
             
-            const chunk = getChunk(cx, cz); // Uses Smart Cache
+            const chunk = getChunk(cx, cz); 
             if (!chunk) return false;
             
             let lx = x % CHUNK_SIZE; if(lx < 0) lx += CHUNK_SIZE;
@@ -507,8 +558,8 @@
                 let lx = x % CHUNK_SIZE; if(lx < 0) lx += CHUNK_SIZE;
                 let lz = z % CHUNK_SIZE; if(lz < 0) lz += CHUNK_SIZE;
                 chunk.setBlock(lx, y, lz, id);
-                chunk.buildMesh();
-                // Update neighbors logic remains same (less frequent)
+                chunk.buildMesh(); 
+                
                 if (lx === 0) updateChunkMesh(cx - 1, cz);
                 if (lx === CHUNK_SIZE - 1) updateChunkMesh(cx + 1, cz);
                 if (lz === 0) updateChunkMesh(cx, cz - 1);
@@ -517,6 +568,7 @@
         }
         function updateChunkMesh(cx, cz) {
             const chunk = chunks.get(`${cx},${cz}`);
+            // Force rebuild is needed when neighbor changes state (block added/removed)
             if (chunk) chunk.buildMesh();
         }
 
@@ -529,28 +581,40 @@
             lastChunkCheckX = px;
             lastChunkCheckZ = pz;
 
-            // Rebuild queue
             chunkQueue = [];
+            chunkUpdateQueue = [];
+
+            const lodDistSq = Math.pow(renderDistance * LOD_RATIO, 2);
+
             for (let x = -renderDistance; x <= renderDistance; x++) {
                 for (let z = -renderDistance; z <= renderDistance; z++) {
-                    // Pre-calc dist squared
                     const d2 = x*x + z*z;
                     if (d2 > renderDistance*renderDistance) continue;
                     
                     const cx = px + x;
                     const cz = pz + z;
                     const key = `${cx},${cz}`;
+                    
+                    // LOD 2 (Geometric + Texture) kicks in beyond LOD_RATIO
+                    const targetLOD = d2 > lodDistSq ? LOD_STEP_FAR : 1;
+
                     if (!chunks.has(key)) {
-                        chunkQueue.push({cx, cz, dist: d2});
+                        chunkQueue.push({cx, cz, dist: d2, lod: targetLOD});
+                    } else {
+                        const chunk = chunks.get(key);
+                        if (chunk.lod !== targetLOD) {
+                            chunkUpdateQueue.push({ chunk: chunk, targetLOD: targetLOD, dist: d2 });
+                        }
                     }
                 }
             }
+            
             chunkQueue.sort((a, b) => a.dist - b.dist);
+            chunkUpdateQueue.sort((a, b) => a.dist - b.dist);
             
             let removals = 0;
-            // Limit removals per frame to spread load
             for (const [key, chunk] of chunks.entries()) {
-                if (removals > 2) break; 
+                if (removals > 5) break; 
                 if (Math.abs(chunk.cx - px) > renderDistance + 2 || Math.abs(chunk.cz - pz) > renderDistance + 2) {
                     scene.remove(chunk.mesh);
                     chunk.mesh.geometry.dispose();
@@ -561,15 +625,25 @@
         }
 
         function processChunkQueue() {
-            if (chunkQueue.length === 0) return;
-            const c = chunkQueue.shift();
-            const key = `${c.cx},${c.cz}`;
-            if (!chunks.has(key)) {
-                const chunk = new Chunk(c.cx, c.cz);
-                chunks.set(key, chunk);
-                chunk.buildMesh();
+            if (chunkUpdateQueue.length > 0) {
+                const item = chunkUpdateQueue.shift();
+                item.chunk.lod = item.targetLOD;
+                item.chunk.buildMesh();
             }
+
+            if (chunkQueue.length > 0) {
+                const c = chunkQueue.shift();
+                const key = `${c.cx},${c.cz}`;
+                if (!chunks.has(key)) {
+                    const chunk = new Chunk(c.cx, c.cz);
+                    chunk.lod = c.lod; 
+                    chunks.set(key, chunk);
+                    chunk.buildMesh(); 
+                }
+            }
+
             document.getElementById('queue').innerText = chunkQueue.length;
+            document.getElementById('lodUpdates').innerText = chunkUpdateQueue.length;
         }
 
         // --- PHYSICS & INPUT ---
@@ -717,12 +791,12 @@
                 if(camera.position.y < -30) {
                     camera.position.set(0, 150, 0);
                     velocity.set(0,0,0);
-                    queueChunks(true); // Clear queue if teleported
+                    queueChunks(true); 
                 }
             }
             
-            queueChunks(); // Check if we need to add to queue
-            processChunkQueue(); // Build 1 chunk per frame
+            queueChunks(); 
+            processChunkQueue(); 
             
             document.getElementById('fps').innerText = Math.round(1/delta);
             document.getElementById('chunks').innerText = chunks.size;
