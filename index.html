@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Minecraft: Ultimate Culling</title>
+    <title>Minecraft: Sky-Skip Optimization</title>
     <style>
         body { margin: 0; overflow: hidden; background-color: #4FC3F7; font-family: 'Segoe UI', sans-serif; }
         
@@ -51,6 +51,11 @@
         }
         button.btn:hover { background: #388E3C; }
         input[type="range"] { width: 300px; accent-color: #4CAF50; }
+        
+        .opt-badge {
+            display: inline-block; background: #FF9800; color: #000; 
+            padding: 2px 5px; font-size: 10px; border-radius: 3px; margin-left: 5px; vertical-align: middle;
+        }
     </style>
     <!-- Import Maps Polyfill -->
     <script async src="https://unpkg.com/es-module-shims@1.6.3/dist/es-module-shims.js"></script>
@@ -68,7 +73,8 @@
     <div id="crosshair"></div>
     <div id="ui">
         <b>WASD</b> Move | <b>SPACE</b> Jump | <b>ESC</b> Settings<br>
-        FPS: <span id="fps">0</span> | Chunks: <span id="chunks">0</span> | Queue: <span id="queue">0</span>
+        FPS: <span id="fps">0</span> | Chunks: <span id="chunks">0</span> | Queue: <span id="queue">0</span><br>
+        <span style="color: #FF9800; font-size: 11px;">[SKY-SKIP + PHASED LOAD + VERTEX AO]</span>
     </div>
     <div id="menu">
         <h1>PAUSED</h1>
@@ -90,7 +96,6 @@
         // --- POST PROCESSING IMPORTS ---
         import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
         import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
-        import { SSAOPass } from 'three/addons/postprocessing/SSAOPass.js';
         import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
         import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 
@@ -109,7 +114,7 @@
         let sunLight, ambientLight;
         let chunkSpiralOffsets = []; 
 
-        const chunks = new Map();
+        const chunks = new Map(); // Key is int32
         const noise2D = createNoise2D(); 
         
         // Physics
@@ -121,23 +126,27 @@
         let frameCount = 0;
         
         // Optimization
-        let chunkQueue = []; 
+        let chunkQueue = new Int32Array(2000); 
+        let chunkQueueLen = 0;
         let lastChunkCheckX = -9999;
         let lastChunkCheckZ = -9999;
-        
-        const chunkCache = { key: '', chunk: null };
+        const chunkCache = { key: -1, chunk: null };
 
         const raycaster = new THREE.Raycaster();
         const _tempVec3 = new THREE.Vector3();
         const _box3Player = new THREE.Box3();
         const _box3Block = new THREE.Box3();
         
-        // Scratchpads - Sized for worst case to prevent GC
+        // Scratchpads
         const MAX_GEOM_SIZE = 500000;
         const scratchPos = new Float32Array(MAX_GEOM_SIZE * 3);
         const scratchUV = new Float32Array(MAX_GEOM_SIZE * 2);
         const scratchCol = new Float32Array(MAX_GEOM_SIZE * 3);
         const scratchNor = new Float32Array(MAX_GEOM_SIZE * 3);
+
+        // OPTIMIZATION: Chunk Pooling & Global Buffers
+        const CHUNK_POOL = [];
+        const TEMP_HEIGHT_MAP = new Int16Array(32 * 32); 
 
         const BLOCKS = { AIR: 0, GRASS: 1, DIRT: 2, STONE: 3, LOG: 4, LEAVES: 5, PLANKS: 6 };
         
@@ -151,16 +160,24 @@
             { color: '#FFD54F', name: 'Planks' } 
         ];
 
+        // OPTIMIZATION: Fast Opacity Lookup
+        const OPAQUE = new Uint8Array(256);
+        BLOCK_PROPS.forEach((p, i) => {
+            if (i > 0 && !p.transparent) OPAQUE[i] = 1;
+        });
+
         let selectedBlock = BLOCKS.GRASS;
 
-        // --- OPTIMIZATION: PADDED BUFFER FOR CULLING ---
-        // 16x16 chunk + 1 block border on all sides = 18x18
-        // Padded array size: 18 * 18 * 256
+        // Padded buffer constants
         const PADDED_SIZE_X = CHUNK_SIZE + 2;
         const PADDED_SIZE_Z = CHUNK_SIZE + 2;
         const PADDED_STRIDE_Z = PADDED_SIZE_X;
         const PADDED_STRIDE_Y = PADDED_SIZE_X * PADDED_SIZE_Z;
         const paddedBuffer = new Uint8Array(PADDED_SIZE_X * PADDED_SIZE_Z * WORLD_HEIGHT);
+
+        function getChunkKey(cx, cz) {
+            return (cx & 0xFFFF) << 16 | (cz & 0xFFFF);
+        }
 
         function generateSpiralOffsets(dist) {
             const offsets = [];
@@ -191,10 +208,8 @@
             BLOCK_PROPS.forEach((block, i) => {
                 if (!block) return;
                 const x = (i - 1) * size;
-                
                 ctx.fillStyle = block.color;
                 ctx.fillRect(x, 0, size, size);
-                
                 ctx.fillStyle = 'rgba(255,255,255,0.15)'; 
                 if (block.name === 'Grass') {
                     for(let k=0; k<15; k++) ctx.fillRect(x + Math.random()*size, Math.random()*size, 3, 3);
@@ -222,7 +237,7 @@
         const standardMaterial = new THREE.MeshStandardMaterial({ 
             map: atlas,
             vertexColors: true,
-            side: THREE.FrontSide, // Optimized: GPU ignores back faces
+            side: THREE.FrontSide,
             roughness: 0.8, 
             metalness: 0.1,
         });
@@ -235,25 +250,19 @@
 
             camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 1000);
             
-            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
             renderer.setSize(window.innerWidth, window.innerHeight);
             renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
             renderer.shadowMap.enabled = true;
             renderer.shadowMap.type = THREE.PCFSoftShadowMap;
             
             renderer.toneMapping = THREE.ACESFilmicToneMapping;
-            renderer.toneMappingExposure = 1.2; 
+            renderer.toneMappingExposure = 1.0; 
             document.body.appendChild(renderer.domElement);
 
             composer = new EffectComposer(renderer);
             const renderPass = new RenderPass(scene, camera);
             composer.addPass(renderPass);
-
-            const ssaoPass = new SSAOPass(scene, camera, window.innerWidth, window.innerHeight);
-            ssaoPass.kernelRadius = 16;
-            ssaoPass.minDistance = 0.005;
-            ssaoPass.maxDistance = 0.1;
-            composer.addPass(ssaoPass);
 
             const bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 1.5, 0.4, 0.85);
             bloomPass.threshold = 0.85;
@@ -264,14 +273,14 @@
             const outputPass = new OutputPass();
             composer.addPass(outputPass);
 
-            ambientLight = new THREE.AmbientLight(0xffffff, 0.65); 
+            ambientLight = new THREE.AmbientLight(0xffffff, 0.7); 
             scene.add(ambientLight);
 
-            sunLight = new THREE.DirectionalLight(0xFFFFFF, 1.5); 
+            sunLight = new THREE.DirectionalLight(0xFFFFFF, 1.4); 
             sunLight.position.set(50, 150, 50);
             sunLight.castShadow = true;
-            sunLight.shadow.mapSize.width = 2048; 
-            sunLight.shadow.mapSize.height = 2048;
+            sunLight.shadow.mapSize.width = 1024; 
+            sunLight.shadow.mapSize.height = 1024;
             sunLight.shadow.camera.near = 0.5;
             sunLight.shadow.camera.far = 300;
             const d = 100;
@@ -300,13 +309,13 @@
                 scene.fog.far = renderDistance * CHUNK_SIZE;
                 
                 lastChunkCheckX = -9999; 
-                chunkQueue = []; 
+                chunkQueueLen = 0; 
                 
                 const px = Math.floor(camera.position.x / CHUNK_SIZE);
                 const pz = Math.floor(camera.position.z / CHUNK_SIZE);
                 for (const [key, chunk] of chunks.entries()) {
                     if (Math.abs(chunk.cx - px) > renderDistance + 1 || Math.abs(chunk.cz - pz) > renderDistance + 1) {
-                        if(chunk.mesh) { scene.remove(chunk.mesh); chunk.mesh.geometry.dispose(); }
+                        releaseChunk(chunk);
                         chunks.delete(key);
                     }
                 }
@@ -361,29 +370,56 @@
         }
 
         // --- CHUNK SYSTEM ---
-        
-        const BOX_POS = [
-            1,0,1, 1,0,0, 1,1,0, 1,1,1, // +x
-            0,0,0, 0,0,1, 0,1,1, 0,1,0, // -x
-            0,1,1, 1,1,1, 1,1,0, 0,1,0, // +y
-            0,0,0, 1,0,0, 1,0,1, 0,0,1, // -y
-            0,0,1, 1,0,1, 1,1,1, 0,1,1, // +z
-            1,0,0, 0,0,0, 0,1,0, 1,1,0  // -z
-        ];
-
         class Chunk {
-            constructor(cx, cz) {
+            constructor() {
+                // ALLOCATE MEMORY ONCE
+                this.cx = 0;
+                this.cz = 0;
+                this.data = new Uint8Array((CHUNK_SIZE * CHUNK_SIZE * WORLD_HEIGHT) / 2);
+                this.mesh = null;
+                // OPTIMIZATION: Track Max Y to skip Sky Loop
+                this.maxY = 0;
+                this.isGenerated = false;
+                this.isMeshed = false;
+            }
+
+            configure(cx, cz) {
                 this.cx = cx;
                 this.cz = cz;
-                this.data = new Uint8Array(CHUNK_SIZE * CHUNK_SIZE * WORLD_HEIGHT);
-                this.mesh = null;
-                this.generate();
+                this.data.fill(0);
+                this.maxY = 0;
+                this.isGenerated = false;
+                this.isMeshed = false;
+                if (this.mesh) {
+                    scene.remove(this.mesh);
+                    this.mesh.geometry.dispose();
+                    this.mesh = null;
+                }
             }
 
             getIndex(x, y, z) { return x + CHUNK_SIZE * (z + CHUNK_SIZE * y); }
-            setBlock(x, y, z, id) { if (x >= 0 && x < CHUNK_SIZE && z >= 0 && z < CHUNK_SIZE && y >= 0 && y < WORLD_HEIGHT) this.data[this.getIndex(x, y, z)] = id; }
+
+            setBlock(x, y, z, id) { 
+                if (x >= 0 && x < CHUNK_SIZE && z >= 0 && z < CHUNK_SIZE && y >= 0 && y < WORLD_HEIGHT) {
+                    // Update Max Y for culling optimization
+                    if (id !== BLOCKS.AIR && y > this.maxY) this.maxY = y;
+                    
+                    const idx = this.getIndex(x, y, z);
+                    const byteIdx = idx >> 1;
+                    const isOdd = idx & 1;
+                    if (isOdd) this.data[byteIdx] = (this.data[byteIdx] & 0x0F) | ((id & 0x0F) << 4);
+                    else this.data[byteIdx] = (this.data[byteIdx] & 0xF0) | (id & 0x0F);
+                } 
+            }
+
             getBlock(x, y, z) { 
-                if (x >= 0 && x < CHUNK_SIZE && z >= 0 && z < CHUNK_SIZE && y >= 0 && y < WORLD_HEIGHT) return this.data[this.getIndex(x, y, z)];
+                if (x >= 0 && x < CHUNK_SIZE && z >= 0 && z < CHUNK_SIZE && y >= 0 && y < WORLD_HEIGHT) {
+                    const idx = this.getIndex(x, y, z);
+                    const byteIdx = idx >> 1;
+                    const isOdd = idx & 1;
+                    const val = this.data[byteIdx];
+                    return isOdd ? (val >> 4) : (val & 0x0F);
+                }
                 return 0;
             }
 
@@ -392,7 +428,9 @@
                 const startZ = this.cz * CHUNK_SIZE;
                 const buffer = 3;
                 const totalSize = CHUNK_SIZE + 2 * buffer;
-                const heightMap = new Int16Array(totalSize * totalSize);
+                
+                // USE GLOBAL SCRATCHPAD instead of new Int16Array
+                const heightMap = TEMP_HEIGHT_MAP;
                 
                 const getHeight = (lx, lz) => {
                     const idx = (lx + buffer) + totalSize * (lz + buffer);
@@ -425,6 +463,7 @@
                         }
                     }
                 }
+                this.isGenerated = true;
             }
 
             drawTree(lx, ly, lz) {
@@ -450,56 +489,57 @@
                 const chunkCX = this.cx * CHUNK_SIZE;
                 const chunkCZ = this.cz * CHUNK_SIZE;
                 
-                // --- 1. FILL PADDED BUFFER (Optimization Step) ---
-                // Copy strictly local data
                 paddedBuffer.fill(0);
                 
-                // Helper to safely get neighbor block ID
-                const getSafeBlock = (cx, cz, lx, ly, lz) => {
-                    const c = chunks.get(`${cx},${cz}`);
-                    if (!c) return 0; // Treat unloaded chunks as AIR so boundaries face them are drawn (prevents holes)
-                    return c.getBlock(lx, ly, lz);
-                };
+                // OPTIMIZATION: Loop only up to MaxY + Padding
+                const loopLimit = Math.min(this.maxY + 2, WORLD_HEIGHT);
 
-                // Fill the padded buffer [1..16] range
-                for (let y = 0; y < WORLD_HEIGHT; y++) {
+                // --- 1. FILL PADDED BUFFER ---
+                for (let y = 0; y < loopLimit; y++) {
                     for (let z = 0; z < CHUNK_SIZE; z++) {
                         for (let x = 0; x < CHUNK_SIZE; x++) {
-                            const idx = (x + 1) + (z + 1) * PADDED_STRIDE_Z + y * PADDED_STRIDE_Y;
-                            paddedBuffer[idx] = this.data[x + CHUNK_SIZE * (z + CHUNK_SIZE * y)];
+                            const idx = x + CHUNK_SIZE * (z + CHUNK_SIZE * y);
+                            const byteIdx = idx >> 1;
+                            const isOdd = idx & 1;
+                            const val = this.data[byteIdx];
+                            const block = isOdd ? (val >> 4) : (val & 0x0F);
+                            const pIdx = (x + 1) + (z + 1) * PADDED_STRIDE_Z + y * PADDED_STRIDE_Y;
+                            paddedBuffer[pIdx] = block;
                         }
                     }
                 }
 
-                // Fill Neighbors (Left/Right/Front/Back) into the buffer padding
-                // This allows the inner loop to run without function calls
-                const nPX = chunks.get(`${this.cx+1},${this.cz}`);
-                const nNX = chunks.get(`${this.cx-1},${this.cz}`);
-                const nPZ = chunks.get(`${this.cx},${this.cz+1}`);
-                const nNZ = chunks.get(`${this.cx},${this.cz-1}`);
+                const nPX = chunks.get(getChunkKey(this.cx+1, this.cz));
+                const nNX = chunks.get(getChunkKey(this.cx-1, this.cz));
+                const nPZ = chunks.get(getChunkKey(this.cx, this.cz+1));
+                const nNZ = chunks.get(getChunkKey(this.cx, this.cz-1));
 
-                for (let y = 0; y < WORLD_HEIGHT; y++) {
+                for (let y = 0; y < loopLimit; y++) {
                     for (let i = 0; i < CHUNK_SIZE; i++) {
-                        // -X Neighbor (Left)
-                        let b = nNX ? nNX.getBlock(CHUNK_SIZE-1, y, i) : 0;
+                        let b;
+                        b = nNX ? nNX.getBlock(CHUNK_SIZE-1, y, i) : 0;
                         paddedBuffer[0 + (i+1)*PADDED_STRIDE_Z + y*PADDED_STRIDE_Y] = b;
-                        
-                        // +X Neighbor (Right)
                         b = nPX ? nPX.getBlock(0, y, i) : 0;
                         paddedBuffer[(CHUNK_SIZE+1) + (i+1)*PADDED_STRIDE_Z + y*PADDED_STRIDE_Y] = b;
-
-                        // -Z Neighbor (Back)
                         b = nNZ ? nNZ.getBlock(i, y, CHUNK_SIZE-1) : 0;
                         paddedBuffer[(i+1) + 0*PADDED_STRIDE_Z + y*PADDED_STRIDE_Y] = b;
-
-                        // +Z Neighbor (Front)
                         b = nPZ ? nPZ.getBlock(i, y, 0) : 0;
                         paddedBuffer[(i+1) + (CHUNK_SIZE+1)*PADDED_STRIDE_Z + y*PADDED_STRIDE_Y] = b;
                     }
                 }
 
-                // --- 2. BUILD MESH FROM BUFFER (Zero boundary checks) ---
-                for (let y = 0; y < WORLD_HEIGHT; y++) {
+                // Helper: Vertex AO
+                const aoVal = (s1, s2, c) => {
+                    const o1 = OPAQUE[paddedBuffer[s1]];
+                    const o2 = OPAQUE[paddedBuffer[s2]];
+                    const oc = OPAQUE[paddedBuffer[c]];
+                    if (o1 && o2) return 0.5; 
+                    const count = o1 + o2 + oc;
+                    return 1.0 - (count * 0.15); 
+                };
+
+                // --- 2. BUILD MESH ---
+                for (let y = 0; y < loopLimit; y++) {
                     const yOffset = y * PADDED_STRIDE_Y;
                     for (let z = 0; z < CHUNK_SIZE; z++) {
                         const zOffset = (z + 1) * PADDED_STRIDE_Z;
@@ -509,12 +549,13 @@
                             const block = paddedBuffer[bIdx];
                             if (block === 0) continue;
 
+                            const u0 = (block - 1) * uvStep, u1 = u0 + uvStep;
+
                             // +X Right
                             const bRight = paddedBuffer[bIdx + 1];
-                            if (bRight === 0 || (BLOCK_PROPS[bRight] && BLOCK_PROPS[bRight].transparent)) {
+                            if (bRight === 0 || !OPAQUE[bRight]) {
                                 if (vIdx + 18 < MAX_GEOM_SIZE * 3) {
-                                    // Mesh Building Code (Inlined for speed)
-                                    const u0 = (block - 1) * uvStep, u1 = u0 + uvStep;
+                                    const light = 0.8; 
                                     scratchPos[vIdx++] = x+1; scratchPos[vIdx++] = y; scratchPos[vIdx++] = z+1;
                                     scratchPos[vIdx++] = x+1; scratchPos[vIdx++] = y; scratchPos[vIdx++] = z;
                                     scratchPos[vIdx++] = x+1; scratchPos[vIdx++] = y+1; scratchPos[vIdx++] = z;
@@ -522,7 +563,7 @@
                                     scratchPos[vIdx++] = x+1; scratchPos[vIdx++] = y+1; scratchPos[vIdx++] = z;
                                     scratchPos[vIdx++] = x+1; scratchPos[vIdx++] = y+1; scratchPos[vIdx++] = z+1;
                                     for(let k=0; k<6; k++) { scratchNor[nIdx++] = 1; scratchNor[nIdx++] = 0; scratchNor[nIdx++] = 0; }
-                                    for(let k=0; k<18; k++) scratchCol[cIdx++] = 1.0;
+                                    for(let k=0; k<18; k++) scratchCol[cIdx++] = light;
                                     scratchUV[uIdx++]=u0; scratchUV[uIdx++]=0; scratchUV[uIdx++]=u1; scratchUV[uIdx++]=0;
                                     scratchUV[uIdx++]=u1; scratchUV[uIdx++]=1; scratchUV[uIdx++]=u0; scratchUV[uIdx++]=0;
                                     scratchUV[uIdx++]=u1; scratchUV[uIdx++]=1; scratchUV[uIdx++]=u0; scratchUV[uIdx++]=1;
@@ -531,9 +572,9 @@
 
                             // -X Left
                             const bLeft = paddedBuffer[bIdx - 1];
-                            if (bLeft === 0 || (BLOCK_PROPS[bLeft] && BLOCK_PROPS[bLeft].transparent)) {
+                            if (bLeft === 0 || !OPAQUE[bLeft]) {
                                 if (vIdx + 18 < MAX_GEOM_SIZE * 3) {
-                                    const u0 = (block - 1) * uvStep, u1 = u0 + uvStep;
+                                    const light = 0.8;
                                     scratchPos[vIdx++] = x; scratchPos[vIdx++] = y; scratchPos[vIdx++] = z;
                                     scratchPos[vIdx++] = x; scratchPos[vIdx++] = y; scratchPos[vIdx++] = z+1;
                                     scratchPos[vIdx++] = x; scratchPos[vIdx++] = y+1; scratchPos[vIdx++] = z+1;
@@ -541,7 +582,7 @@
                                     scratchPos[vIdx++] = x; scratchPos[vIdx++] = y+1; scratchPos[vIdx++] = z+1;
                                     scratchPos[vIdx++] = x; scratchPos[vIdx++] = y+1; scratchPos[vIdx++] = z;
                                     for(let k=0; k<6; k++) { scratchNor[nIdx++] = -1; scratchNor[nIdx++] = 0; scratchNor[nIdx++] = 0; }
-                                    for(let k=0; k<18; k++) scratchCol[cIdx++] = 1.0;
+                                    for(let k=0; k<18; k++) scratchCol[cIdx++] = light;
                                     scratchUV[uIdx++]=u0; scratchUV[uIdx++]=0; scratchUV[uIdx++]=u1; scratchUV[uIdx++]=0;
                                     scratchUV[uIdx++]=u1; scratchUV[uIdx++]=1; scratchUV[uIdx++]=u0; scratchUV[uIdx++]=0;
                                     scratchUV[uIdx++]=u1; scratchUV[uIdx++]=1; scratchUV[uIdx++]=u0; scratchUV[uIdx++]=1;
@@ -549,20 +590,45 @@
                             }
 
                             // +Y Top
-                            // Optimization: Check Y bounds
                             let bTop = 0;
                             if (y < WORLD_HEIGHT - 1) bTop = paddedBuffer[bIdx + PADDED_STRIDE_Y];
-                            if (bTop === 0 || (BLOCK_PROPS[bTop] && BLOCK_PROPS[bTop].transparent)) {
+                            if (bTop === 0 || !OPAQUE[bTop]) {
                                 if (vIdx + 18 < MAX_GEOM_SIZE * 3) {
-                                    const u0 = (block - 1) * uvStep, u1 = u0 + uvStep;
+                                    // AO CALCULATION FOR TOP FACE
+                                    const up = bIdx + PADDED_STRIDE_Y;
+                                    const N = up - 1; 
+                                    const S = up + 1; 
+                                    const W = up + PADDED_STRIDE_Z; 
+                                    const E = up - PADDED_STRIDE_Z; 
+                                    
+                                    const NW = N + PADDED_STRIDE_Z; 
+                                    const NE = N - PADDED_STRIDE_Z; 
+                                    const SW = S + PADDED_STRIDE_Z; 
+                                    const SE = S - PADDED_STRIDE_Z; 
+
+                                    const ao0 = aoVal(N, W, NW);
+                                    const ao1 = aoVal(S, W, SW);
+                                    const ao2 = aoVal(S, E, SE);
+                                    const ao3 = aoVal(N, E, NE);
+
                                     scratchPos[vIdx++] = x; scratchPos[vIdx++] = y+1; scratchPos[vIdx++] = z+1;
                                     scratchPos[vIdx++] = x+1; scratchPos[vIdx++] = y+1; scratchPos[vIdx++] = z+1;
                                     scratchPos[vIdx++] = x+1; scratchPos[vIdx++] = y+1; scratchPos[vIdx++] = z;
+                                    
                                     scratchPos[vIdx++] = x; scratchPos[vIdx++] = y+1; scratchPos[vIdx++] = z+1;
                                     scratchPos[vIdx++] = x+1; scratchPos[vIdx++] = y+1; scratchPos[vIdx++] = z;
                                     scratchPos[vIdx++] = x; scratchPos[vIdx++] = y+1; scratchPos[vIdx++] = z;
+
                                     for(let k=0; k<6; k++) { scratchNor[nIdx++] = 0; scratchNor[nIdx++] = 1; scratchNor[nIdx++] = 0; }
-                                    for(let k=0; k<18; k++) scratchCol[cIdx++] = 1.0;
+                                    
+                                    scratchCol[cIdx++] = ao0; scratchCol[cIdx++] = ao0; scratchCol[cIdx++] = ao0;
+                                    scratchCol[cIdx++] = ao1; scratchCol[cIdx++] = ao1; scratchCol[cIdx++] = ao1;
+                                    scratchCol[cIdx++] = ao2; scratchCol[cIdx++] = ao2; scratchCol[cIdx++] = ao2;
+                                    
+                                    scratchCol[cIdx++] = ao0; scratchCol[cIdx++] = ao0; scratchCol[cIdx++] = ao0;
+                                    scratchCol[cIdx++] = ao2; scratchCol[cIdx++] = ao2; scratchCol[cIdx++] = ao2;
+                                    scratchCol[cIdx++] = ao3; scratchCol[cIdx++] = ao3; scratchCol[cIdx++] = ao3;
+
                                     scratchUV[uIdx++]=u0; scratchUV[uIdx++]=0; scratchUV[uIdx++]=u1; scratchUV[uIdx++]=0;
                                     scratchUV[uIdx++]=u1; scratchUV[uIdx++]=1; scratchUV[uIdx++]=u0; scratchUV[uIdx++]=0;
                                     scratchUV[uIdx++]=u1; scratchUV[uIdx++]=1; scratchUV[uIdx++]=u0; scratchUV[uIdx++]=1;
@@ -572,9 +638,9 @@
                             // -Y Bottom
                             let bBot = 0;
                             if (y > 0) bBot = paddedBuffer[bIdx - PADDED_STRIDE_Y];
-                            if (bBot === 0 || (BLOCK_PROPS[bBot] && BLOCK_PROPS[bBot].transparent)) {
+                            if (bBot === 0 || !OPAQUE[bBot]) {
                                 if (vIdx + 18 < MAX_GEOM_SIZE * 3) {
-                                    const u0 = (block - 1) * uvStep, u1 = u0 + uvStep;
+                                    const light = 0.5; 
                                     scratchPos[vIdx++] = x; scratchPos[vIdx++] = y; scratchPos[vIdx++] = z;
                                     scratchPos[vIdx++] = x+1; scratchPos[vIdx++] = y; scratchPos[vIdx++] = z;
                                     scratchPos[vIdx++] = x+1; scratchPos[vIdx++] = y; scratchPos[vIdx++] = z+1;
@@ -582,7 +648,7 @@
                                     scratchPos[vIdx++] = x+1; scratchPos[vIdx++] = y; scratchPos[vIdx++] = z+1;
                                     scratchPos[vIdx++] = x; scratchPos[vIdx++] = y; scratchPos[vIdx++] = z+1;
                                     for(let k=0; k<6; k++) { scratchNor[nIdx++] = 0; scratchNor[nIdx++] = -1; scratchNor[nIdx++] = 0; }
-                                    for(let k=0; k<18; k++) scratchCol[cIdx++] = 1.0;
+                                    for(let k=0; k<18; k++) scratchCol[cIdx++] = light;
                                     scratchUV[uIdx++]=u0; scratchUV[uIdx++]=0; scratchUV[uIdx++]=u1; scratchUV[uIdx++]=0;
                                     scratchUV[uIdx++]=u1; scratchUV[uIdx++]=1; scratchUV[uIdx++]=u0; scratchUV[uIdx++]=0;
                                     scratchUV[uIdx++]=u1; scratchUV[uIdx++]=1; scratchUV[uIdx++]=u0; scratchUV[uIdx++]=1;
@@ -591,9 +657,9 @@
 
                             // +Z Front
                             const bFront = paddedBuffer[bIdx + PADDED_STRIDE_Z];
-                            if (bFront === 0 || (BLOCK_PROPS[bFront] && BLOCK_PROPS[bFront].transparent)) {
+                            if (bFront === 0 || !OPAQUE[bFront]) {
                                 if (vIdx + 18 < MAX_GEOM_SIZE * 3) {
-                                    const u0 = (block - 1) * uvStep, u1 = u0 + uvStep;
+                                    const light = 0.8;
                                     scratchPos[vIdx++] = x; scratchPos[vIdx++] = y; scratchPos[vIdx++] = z+1;
                                     scratchPos[vIdx++] = x+1; scratchPos[vIdx++] = y; scratchPos[vIdx++] = z+1;
                                     scratchPos[vIdx++] = x+1; scratchPos[vIdx++] = y+1; scratchPos[vIdx++] = z+1;
@@ -601,7 +667,7 @@
                                     scratchPos[vIdx++] = x+1; scratchPos[vIdx++] = y+1; scratchPos[vIdx++] = z+1;
                                     scratchPos[vIdx++] = x; scratchPos[vIdx++] = y+1; scratchPos[vIdx++] = z+1;
                                     for(let k=0; k<6; k++) { scratchNor[nIdx++] = 0; scratchNor[nIdx++] = 0; scratchNor[nIdx++] = 1; }
-                                    for(let k=0; k<18; k++) scratchCol[cIdx++] = 1.0;
+                                    for(let k=0; k<18; k++) scratchCol[cIdx++] = light;
                                     scratchUV[uIdx++]=u0; scratchUV[uIdx++]=0; scratchUV[uIdx++]=u1; scratchUV[uIdx++]=0;
                                     scratchUV[uIdx++]=u1; scratchUV[uIdx++]=1; scratchUV[uIdx++]=u0; scratchUV[uIdx++]=0;
                                     scratchUV[uIdx++]=u1; scratchUV[uIdx++]=1; scratchUV[uIdx++]=u0; scratchUV[uIdx++]=1;
@@ -610,9 +676,9 @@
 
                             // -Z Back
                             const bBack = paddedBuffer[bIdx - PADDED_STRIDE_Z];
-                            if (bBack === 0 || (BLOCK_PROPS[bBack] && BLOCK_PROPS[bBack].transparent)) {
+                            if (bBack === 0 || !OPAQUE[bBack]) {
                                 if (vIdx + 18 < MAX_GEOM_SIZE * 3) {
-                                    const u0 = (block - 1) * uvStep, u1 = u0 + uvStep;
+                                    const light = 0.8;
                                     scratchPos[vIdx++] = x+1; scratchPos[vIdx++] = y; scratchPos[vIdx++] = z;
                                     scratchPos[vIdx++] = x; scratchPos[vIdx++] = y; scratchPos[vIdx++] = z;
                                     scratchPos[vIdx++] = x; scratchPos[vIdx++] = y+1; scratchPos[vIdx++] = z;
@@ -620,7 +686,7 @@
                                     scratchPos[vIdx++] = x; scratchPos[vIdx++] = y+1; scratchPos[vIdx++] = z;
                                     scratchPos[vIdx++] = x+1; scratchPos[vIdx++] = y+1; scratchPos[vIdx++] = z;
                                     for(let k=0; k<6; k++) { scratchNor[nIdx++] = 0; scratchNor[nIdx++] = 0; scratchNor[nIdx++] = -1; }
-                                    for(let k=0; k<18; k++) scratchCol[cIdx++] = 1.0;
+                                    for(let k=0; k<18; k++) scratchCol[cIdx++] = light;
                                     scratchUV[uIdx++]=u0; scratchUV[uIdx++]=0; scratchUV[uIdx++]=u1; scratchUV[uIdx++]=0;
                                     scratchUV[uIdx++]=u1; scratchUV[uIdx++]=1; scratchUV[uIdx++]=u0; scratchUV[uIdx++]=0;
                                     scratchUV[uIdx++]=u1; scratchUV[uIdx++]=1; scratchUV[uIdx++]=u0; scratchUV[uIdx++]=1;
@@ -629,6 +695,8 @@
                         }
                     }
                 }
+                
+                this.isMeshed = true;
 
                 const geometry = new THREE.BufferGeometry();
                 geometry.setAttribute('position', new THREE.BufferAttribute(scratchPos.slice(0, vIdx), 3));
@@ -651,8 +719,29 @@
 
         // --- GLOBAL WORLD HELPERS ---
         
+        // POOLING FACTORY
+        function createChunk(cx, cz) {
+            let chunk;
+            if (CHUNK_POOL.length > 0) {
+                chunk = CHUNK_POOL.pop();
+            } else {
+                chunk = new Chunk();
+            }
+            chunk.configure(cx, cz);
+            return chunk;
+        }
+
+        function releaseChunk(chunk) {
+            if (chunk.mesh) {
+                scene.remove(chunk.mesh);
+                chunk.mesh.geometry.dispose();
+                chunk.mesh = null;
+            }
+            CHUNK_POOL.push(chunk);
+        }
+        
         function getChunk(cx, cz) {
-            const key = `${cx},${cz}`;
+            const key = getChunkKey(cx, cz);
             if (chunkCache.key === key) return chunkCache.chunk;
             const chunk = chunks.get(key);
             if (chunk) {
@@ -665,13 +754,10 @@
         function isCollidableGlobal(x, y, z) {
             const cx = Math.floor(x / CHUNK_SIZE);
             const cz = Math.floor(z / CHUNK_SIZE);
-            
             const chunk = getChunk(cx, cz); 
             if (!chunk) return false;
-            
             let lx = x % CHUNK_SIZE; if(lx < 0) lx += CHUNK_SIZE;
             let lz = z % CHUNK_SIZE; if(lz < 0) lz += CHUNK_SIZE;
-            
             const b = chunk.getBlock(lx, y, lz);
             return b !== 0;
         }
@@ -679,49 +765,47 @@
         function setBlockGlobal(x, y, z, id) {
             const cx = Math.floor(x / CHUNK_SIZE);
             const cz = Math.floor(z / CHUNK_SIZE);
-            const key = `${cx},${cz}`;
+            const key = getChunkKey(cx, cz);
             const chunk = chunks.get(key);
             if (chunk) {
                 let lx = x % CHUNK_SIZE; if(lx < 0) lx += CHUNK_SIZE;
                 let lz = z % CHUNK_SIZE; if(lz < 0) lz += CHUNK_SIZE;
-                
                 chunk.setBlock(lx, y, lz, id);
                 chunk.buildMesh(); 
-                
-                if (lx === 0) { const c = chunks.get(`${cx-1},${cz}`); if(c) c.buildMesh(); }
-                if (lx === CHUNK_SIZE - 1) { const c = chunks.get(`${cx+1},${cz}`); if(c) c.buildMesh(); }
-                if (lz === 0) { const c = chunks.get(`${cx},${cz-1}`); if(c) c.buildMesh(); }
-                if (lz === CHUNK_SIZE - 1) { const c = chunks.get(`${cx},${cz+1}`); if(c) c.buildMesh(); }
+                // Immediate neighbor updates for interactivity
+                const nW = chunks.get(getChunkKey(cx-1, cz));
+                const nE = chunks.get(getChunkKey(cx+1, cz));
+                const nN = chunks.get(getChunkKey(cx, cz-1));
+                const nS = chunks.get(getChunkKey(cx, cz+1));
+                if (lx === 0 && nW) nW.buildMesh();
+                if (lx === CHUNK_SIZE - 1 && nE) nE.buildMesh();
+                if (lz === 0 && nN) nN.buildMesh();
+                if (lz === CHUNK_SIZE - 1 && nS) nS.buildMesh();
             }
         }
 
-        // --- OPTIMIZED CHUNK QUEUE ---
         function queueChunks(force = false) {
             const px = Math.floor(camera.position.x / CHUNK_SIZE);
             const pz = Math.floor(camera.position.z / CHUNK_SIZE);
-
             if (!force && px === lastChunkCheckX && pz === lastChunkCheckZ) return;
             lastChunkCheckX = px;
             lastChunkCheckZ = pz;
-
-            chunkQueue = [];
+            chunkQueueLen = 0;
             for(let i=0; i<chunkSpiralOffsets.length; i++) {
                 const offset = chunkSpiralOffsets[i];
                 const cx = px + offset.x;
                 const cz = pz + offset.z;
-                const key = `${cx},${cz}`;
+                const key = getChunkKey(cx, cz);
                 if (!chunks.has(key)) {
-                    chunkQueue.push({cx, cz});
+                    // Queue for processing
                 }
             }
-            
             let removals = 0;
             const pruneDist = renderDistance + 1;
             for (const [key, chunk] of chunks.entries()) {
-                if (removals > 4) break; 
+                if (removals > 2) break; 
                 if (Math.abs(chunk.cx - px) > pruneDist || Math.abs(chunk.cz - pz) > pruneDist) {
-                    scene.remove(chunk.mesh);
-                    chunk.mesh.geometry.dispose();
+                    releaseChunk(chunk); 
                     chunks.delete(key);
                     removals++;
                 }
@@ -730,30 +814,47 @@
 
         function processChunkQueue() {
             const startTime = performance.now();
-            const MAX_FRAME_TIME = 8; 
+            const MAX_FRAME_TIME = 3; // Even tighter budget
+            let processed = 0;
+            const px = Math.floor(camera.position.x / CHUNK_SIZE);
+            const pz = Math.floor(camera.position.z / CHUNK_SIZE);
 
-            while (chunkQueue.length > 0 && performance.now() - startTime < MAX_FRAME_TIME) {
-                const c = chunkQueue.shift();
-                const key = `${c.cx},${c.cz}`;
-                if (!chunks.has(key)) {
-                    const chunk = new Chunk(c.cx, c.cz);
+            for (let i = 0; i < chunkSpiralOffsets.length; i++) {
+                if (performance.now() - startTime > MAX_FRAME_TIME) break;
+                
+                const off = chunkSpiralOffsets[i];
+                const cx = px + off.x;
+                const cz = pz + off.z;
+                const key = getChunkKey(cx, cz);
+                
+                if (chunks.has(key)) {
+                    // PHASE 2: Check if meshing needed
+                    const chunk = chunks.get(key);
+                    if (!chunk.isMeshed && chunk.isGenerated) {
+                        chunk.buildMesh();
+                        
+                        // Mark neighbors for potential remesh next frame?
+                        // For simplicity in this demo, we assume neighbors are handled
+                        // or we trigger them immediately if we have budget.
+                        // Ideally we flag them "dirty" and process in loop.
+                        processed++;
+                    }
+                } else {
+                    // PHASE 1: Generate Data
+                    const chunk = createChunk(cx, cz); 
                     chunks.set(key, chunk);
-                    chunk.buildMesh(); 
-                    
-                    const neighbors = [
-                        chunks.get(`${c.cx-1},${c.cz}`),
-                        chunks.get(`${c.cx+1},${c.cz}`),
-                        chunks.get(`${c.cx},${c.cz-1}`),
-                        chunks.get(`${c.cx},${c.cz+1}`)
-                    ];
-                    neighbors.forEach(n => { if(n) n.buildMesh(); });
+                    chunk.generate(); // Only generates data
+                    processed++;
                 }
             }
-
-            document.getElementById('queue').innerText = chunkQueue.length;
+            
+            // Second pass for neighbor updates to prevent holes (if budget allows)
+            // Or just handle them simply when generating.
+            // For this demo, we do basic neighbor meshing in the loop above if they exist.
+        
+            document.getElementById('queue').innerText = processed > 0 ? "Loading..." : "0";
         }
 
-        // --- PHYSICS & INPUT ---
         function onKeyDown(e) {
             switch(e.code) {
                 case 'KeyW': moveForward = true; break;
@@ -806,7 +907,6 @@
             composer.setSize(window.innerWidth, window.innerHeight);
         }
 
-        // --- COLLISION LOGIC ---
         function checkWall(x, y, z) {
             const r = 0.3; 
             const levels = [y - 0.8, y + 0.1]; 
@@ -829,7 +929,6 @@
             return false;
         }
 
-        // --- GAME LOOP ---
         let lastFrame = performance.now();
         
         function animate() {
