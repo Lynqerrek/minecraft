@@ -3,9 +3,9 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Minecraft: Geometric + Texture LOD</title>
+    <title>Minecraft: Ultimate Culling</title>
     <style>
-        body { margin: 0; overflow: hidden; background-color: #87CEEB; font-family: 'Segoe UI', sans-serif; }
+        body { margin: 0; overflow: hidden; background-color: #4FC3F7; font-family: 'Segoe UI', sans-serif; }
         
         #crosshair {
             position: absolute; top: 50%; left: 50%; width: 20px; height: 20px;
@@ -68,14 +68,13 @@
     <div id="crosshair"></div>
     <div id="ui">
         <b>WASD</b> Move | <b>SPACE</b> Jump | <b>ESC</b> Settings<br>
-        FPS: <span id="fps">0</span> | Chunks: <span id="chunks">0</span> | Queue: <span id="queue">0</span><br>
-        LOD Updates: <span id="lodUpdates">0</span>
+        FPS: <span id="fps">0</span> | Chunks: <span id="chunks">0</span> | Queue: <span id="queue">0</span>
     </div>
     <div id="menu">
         <h1>PAUSED</h1>
         <div class="menu-item">
             <label for="distSlider">Render Distance: <span id="distVal">5</span></label><br>
-            <input type="range" id="distSlider" min="2" max="20" value="5" step="1">
+            <input type="range" id="distSlider" min="2" max="16" value="5" step="1">
         </div>
         <div class="menu-item">
             <button class="btn" id="resumeBtn">RESUME</button>
@@ -87,6 +86,13 @@
         import * as THREE from 'three';
         import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
         import { createNoise2D } from 'simplex-noise';
+        
+        // --- POST PROCESSING IMPORTS ---
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+        import { SSAOPass } from 'three/addons/postprocessing/SSAOPass.js';
+        import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+        import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 
         // --- CONFIGURATION ---
         let renderDistance = 5;
@@ -98,12 +104,11 @@
         const AMP_HEIGHT = 140;     
         const BASE_HEIGHT = 50;
         
-        // LOD Settings
-        const LOD_RATIO = 0.3; // Distance ratio where LOD kicks in
-        const LOD_STEP_FAR = 2; // Geometric step for far chunks (2x2x2 blocks become one big block)
-        
         // --- GLOBAL VARIABLES ---
-        let camera, scene, renderer, controls;
+        let camera, scene, renderer, controls, composer;
+        let sunLight, ambientLight;
+        let chunkSpiralOffsets = []; 
+
         const chunks = new Map();
         const noise2D = createNoise2D(); 
         
@@ -113,10 +118,10 @@
         let canJump = false;
         let prevTime = performance.now();
         let isPaused = true;
+        let frameCount = 0;
         
-        // Optimization: Throttling & Caching
+        // Optimization
         let chunkQueue = []; 
-        let chunkUpdateQueue = []; 
         let lastChunkCheckX = -9999;
         let lastChunkCheckZ = -9999;
         
@@ -127,30 +132,57 @@
         const _box3Player = new THREE.Box3();
         const _box3Block = new THREE.Box3();
         
-        // Scratchpads
+        // Scratchpads - Sized for worst case to prevent GC
         const MAX_GEOM_SIZE = 500000;
         const scratchPos = new Float32Array(MAX_GEOM_SIZE * 3);
         const scratchUV = new Float32Array(MAX_GEOM_SIZE * 2);
         const scratchCol = new Float32Array(MAX_GEOM_SIZE * 3);
+        const scratchNor = new Float32Array(MAX_GEOM_SIZE * 3);
 
         const BLOCKS = { AIR: 0, GRASS: 1, DIRT: 2, STONE: 3, LOG: 4, LEAVES: 5, PLANKS: 6 };
         
         const BLOCK_PROPS = [
             null,
-            { color: '#66c246', name: 'Grass' }, 
-            { color: '#8c6348', name: 'Dirt' },  
-            { color: '#969696', name: 'Stone' }, 
-            { color: '#5c4033', name: 'Log' },   
-            { color: '#4a8a3a', name: 'Leaves', transparent: true }, 
-            { color: '#dccfa3', name: 'Planks' } 
+            { color: '#66FF33', name: 'Grass' }, 
+            { color: '#8D6E63', name: 'Dirt' },  
+            { color: '#B0BEC5', name: 'Stone' }, 
+            { color: '#5D4037', name: 'Log' },   
+            { color: '#76FF03', name: 'Leaves', transparent: true }, 
+            { color: '#FFD54F', name: 'Planks' } 
         ];
-        // Total number of block types excluding AIR
-        const BLOCK_TYPE_COUNT = BLOCK_PROPS.length;
 
         let selectedBlock = BLOCKS.GRASS;
 
-        // --- TEXTURES (Variable Size Atlas) ---
-        function createTextureAtlas(size, isLowRes = false) {
+        // --- OPTIMIZATION: PADDED BUFFER FOR CULLING ---
+        // 16x16 chunk + 1 block border on all sides = 18x18
+        // Padded array size: 18 * 18 * 256
+        const PADDED_SIZE_X = CHUNK_SIZE + 2;
+        const PADDED_SIZE_Z = CHUNK_SIZE + 2;
+        const PADDED_STRIDE_Z = PADDED_SIZE_X;
+        const PADDED_STRIDE_Y = PADDED_SIZE_X * PADDED_SIZE_Z;
+        const paddedBuffer = new Uint8Array(PADDED_SIZE_X * PADDED_SIZE_Z * WORLD_HEIGHT);
+
+        function generateSpiralOffsets(dist) {
+            const offsets = [];
+            let x = 0, z = 0, dx = 0, dz = -1;
+            let t = dist * 2 + 1;
+            let maxI = t * t;
+            
+            for (let i = 0; i < maxI; i++) {
+                if ((-dist <= x) && (x <= dist) && (-dist <= z) && (z <= dist)) {
+                    offsets.push({x, z, d2: x*x + z*z});
+                }
+                if ((x === z) || ((x < 0) && (x === -z)) || ((x > 0) && (x === 1 - z))) {
+                    t = dx; dx = -dz; dz = t;
+                }
+                x += dx; z += dz;
+            }
+            return offsets;
+        }
+
+        // --- TEXTURES ---
+        function createTextureAtlas() {
+            const size = 64; 
             const canvas = document.createElement('canvas');
             canvas.width = size * (BLOCK_PROPS.length - 1);
             canvas.height = size;
@@ -160,38 +192,21 @@
                 if (!block) return;
                 const x = (i - 1) * size;
                 
-                // 1. Fill base color (Dominant/1x1 color)
                 ctx.fillStyle = block.color;
                 ctx.fillRect(x, 0, size, size);
                 
-                // 2. Add patterns ONLY for the high-res 8x8 texture
-                if (size >= 8) {
-                    if (block.name === 'Grass') {
-                        ctx.fillStyle = '#8ce870'; 
-                        ctx.fillRect(x + 1, 1, 2, 1); ctx.fillRect(x + 5, 2, 1, 1); ctx.fillRect(x + 2, 6, 1, 1);
-                        ctx.fillStyle = '#4fa132'; ctx.fillRect(x + 1, 7, 6, 1); 
-                    } 
-                    else if (block.name === 'Dirt') {
-                        ctx.fillStyle = '#6b4a34'; 
-                        ctx.fillRect(x + 1, 1, 1, 1); ctx.fillRect(x + 5, 2, 1, 1);
-                        ctx.fillRect(x + 2, 6, 1, 1); ctx.fillRect(x + 6, 5, 1, 1);
-                    } 
-                    else if (block.name === 'Stone') {
-                        ctx.fillStyle = '#757575'; ctx.fillRect(x, 0, size, 1); ctx.fillRect(x, 0, 1, size); 
-                        ctx.fillStyle = '#a8a8a8'; ctx.fillRect(x + 2, 2, 1, 1);
-                    } 
-                    else if (block.name === 'Log') {
-                        ctx.fillStyle = '#4a332a'; ctx.fillRect(x + 2, 0, 1, 8); ctx.fillRect(x + 5, 0, 1, 8);
-                    } 
-                    else if (block.name === 'Leaves') {
-                        ctx.fillStyle = '#3a6e2e'; ctx.fillRect(x + 1, 1, 2, 2); ctx.fillRect(x + 5, 5, 2, 2);
-                        ctx.fillStyle = '#5cb849'; ctx.fillRect(x + 5, 1, 1, 1); ctx.fillRect(x + 2, 6, 1, 1);
-                    } 
-                    else if (block.name === 'Planks') {
-                        ctx.fillStyle = '#bfae82'; 
-                        ctx.fillRect(x, 0, size, 1); ctx.fillRect(x, 4, size, 1); 
-                        ctx.fillRect(x + 3, 1, 1, 3); ctx.fillRect(x + 5, 5, 1, 3); 
-                    }
+                ctx.fillStyle = 'rgba(255,255,255,0.15)'; 
+                if (block.name === 'Grass') {
+                    for(let k=0; k<15; k++) ctx.fillRect(x + Math.random()*size, Math.random()*size, 3, 3);
+                } else if (block.name === 'Stone') {
+                    ctx.fillStyle = 'rgba(0,0,0,0.1)'; 
+                    ctx.fillRect(x+15, 15, 20, 10);
+                    ctx.fillRect(x+40, 40, 10, 10);
+                } else if (block.name === 'Log' || block.name === 'Planks') {
+                    ctx.fillStyle = 'rgba(0,0,0,0.1)'; 
+                    ctx.fillRect(x+8, 12, size-16, 4);
+                    ctx.fillRect(x+8, 32, size-16, 4);
+                    ctx.fillRect(x+8, 52, size-16, 4);
                 }
             });
 
@@ -202,33 +217,70 @@
             return tex;
         }
 
-        const atlasHigh = createTextureAtlas(8, false);
-        const atlasLow = createTextureAtlas(1, false); 
+        const atlas = createTextureAtlas(); 
 
-        const materialHigh = new THREE.MeshBasicMaterial({ 
-            map: atlasHigh,
+        const standardMaterial = new THREE.MeshStandardMaterial({ 
+            map: atlas,
             vertexColors: true,
-            side: THREE.DoubleSide
-        });
-        
-        const materialLow = new THREE.MeshBasicMaterial({ 
-            map: atlasLow,
-            vertexColors: true,
-            side: THREE.DoubleSide
+            side: THREE.FrontSide, // Optimized: GPU ignores back faces
+            roughness: 0.8, 
+            metalness: 0.1,
         });
 
         // --- INIT ---
         function init() {
             scene = new THREE.Scene();
-            scene.background = new THREE.Color(0x87CEEB);
-            updateFog();
+            scene.background = new THREE.Color(0x4FC3F7); 
+            scene.fog = new THREE.Fog(0x4FC3F7, 30, 150);
 
-            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 1000);
             
-            renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: "high-performance" });
+            renderer = new THREE.WebGLRenderer({ antialias: true });
             renderer.setSize(window.innerWidth, window.innerHeight);
             renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            renderer.shadowMap.enabled = true;
+            renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+            
+            renderer.toneMapping = THREE.ACESFilmicToneMapping;
+            renderer.toneMappingExposure = 1.2; 
             document.body.appendChild(renderer.domElement);
+
+            composer = new EffectComposer(renderer);
+            const renderPass = new RenderPass(scene, camera);
+            composer.addPass(renderPass);
+
+            const ssaoPass = new SSAOPass(scene, camera, window.innerWidth, window.innerHeight);
+            ssaoPass.kernelRadius = 16;
+            ssaoPass.minDistance = 0.005;
+            ssaoPass.maxDistance = 0.1;
+            composer.addPass(ssaoPass);
+
+            const bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 1.5, 0.4, 0.85);
+            bloomPass.threshold = 0.85;
+            bloomPass.strength = 0.3; 
+            bloomPass.radius = 0.5;
+            composer.addPass(bloomPass);
+
+            const outputPass = new OutputPass();
+            composer.addPass(outputPass);
+
+            ambientLight = new THREE.AmbientLight(0xffffff, 0.65); 
+            scene.add(ambientLight);
+
+            sunLight = new THREE.DirectionalLight(0xFFFFFF, 1.5); 
+            sunLight.position.set(50, 150, 50);
+            sunLight.castShadow = true;
+            sunLight.shadow.mapSize.width = 2048; 
+            sunLight.shadow.mapSize.height = 2048;
+            sunLight.shadow.camera.near = 0.5;
+            sunLight.shadow.camera.far = 300;
+            const d = 100;
+            sunLight.shadow.camera.left = -d;
+            sunLight.shadow.camera.right = d;
+            sunLight.shadow.camera.top = d;
+            sunLight.shadow.camera.bottom = -d;
+            sunLight.shadow.bias = -0.0005; 
+            scene.add(sunLight);
 
             controls = new PointerLockControls(camera, document.body);
             
@@ -244,12 +296,20 @@
             slider.addEventListener('input', (e) => {
                 renderDistance = parseInt(e.target.value);
                 distVal.innerText = renderDistance;
-                updateFog();
+                chunkSpiralOffsets = generateSpiralOffsets(renderDistance);
+                scene.fog.far = renderDistance * CHUNK_SIZE;
+                
                 lastChunkCheckX = -9999; 
                 chunkQueue = []; 
-                chunkUpdateQueue = [];
-                chunks.forEach(c => { if(c.mesh) { scene.remove(c.mesh); c.mesh.geometry.dispose(); }});
-                chunks.clear();
+                
+                const px = Math.floor(camera.position.x / CHUNK_SIZE);
+                const pz = Math.floor(camera.position.z / CHUNK_SIZE);
+                for (const [key, chunk] of chunks.entries()) {
+                    if (Math.abs(chunk.cx - px) > renderDistance + 1 || Math.abs(chunk.cz - pz) > renderDistance + 1) {
+                        if(chunk.mesh) { scene.remove(chunk.mesh); chunk.mesh.geometry.dispose(); }
+                        chunks.delete(key);
+                    }
+                }
             });
             
             document.addEventListener('keydown', onKeyDown);
@@ -260,13 +320,10 @@
             setupHotbar();
             camera.position.set(0, 150, 0); 
             
+            chunkSpiralOffsets = generateSpiralOffsets(renderDistance);
             queueChunks(true); 
             animate();
             window.addEventListener('resize', onWindowResize);
-        }
-
-        function updateFog() {
-            scene.fog = new THREE.Fog(0x87CEEB, (renderDistance - 1.5) * CHUNK_SIZE, (renderDistance) * CHUNK_SIZE);
         }
 
         function setupHotbar() {
@@ -296,20 +353,11 @@
             selectBlock(idx + 1);
         }
 
-        // --- TERRAIN MATH ---
         function getTerrainHeight(x, z) {
             let n = noise2D(x * NOISE_SCALE, z * NOISE_SCALE);
             let norm = (n + 1) * 0.5; 
             let shaped = Math.pow(norm, 2.5); 
             return Math.floor(BASE_HEIGHT + (shaped * AMP_HEIGHT));
-        }
-
-        function isTreeRoot(x, z) {
-            const treeNoise = noise2D(x * 0.5, z * 0.5); 
-            if (treeNoise < 0.85) return false;
-            const h = getTerrainHeight(x, z);
-            if (h > WORLD_HEIGHT - 10) return false;
-            return true;
         }
 
         // --- CHUNK SYSTEM ---
@@ -322,8 +370,6 @@
             0,0,1, 1,0,1, 1,1,1, 0,1,1, // +z
             1,0,0, 0,0,0, 0,1,0, 1,1,0  // -z
         ];
-        const FACE_BRIGHTNESS = [0.8, 0.8, 1.0, 0.4, 0.6, 0.6];
-        const DIRS = [[1,0,0], [-1,0,0], [0,1,0], [0,-1,0], [0,0,1], [0,0,-1]];
 
         class Chunk {
             constructor(cx, cz) {
@@ -331,7 +377,6 @@
                 this.cz = cz;
                 this.data = new Uint8Array(CHUNK_SIZE * CHUNK_SIZE * WORLD_HEIGHT);
                 this.mesh = null;
-                this.lod = 1; 
                 this.generate();
             }
 
@@ -345,19 +390,38 @@
             generate() {
                 const startX = this.cx * CHUNK_SIZE;
                 const startZ = this.cz * CHUNK_SIZE;
+                const buffer = 3;
+                const totalSize = CHUNK_SIZE + 2 * buffer;
+                const heightMap = new Int16Array(totalSize * totalSize);
+                
+                const getHeight = (lx, lz) => {
+                    const idx = (lx + buffer) + totalSize * (lz + buffer);
+                    return heightMap[idx];
+                }
+
+                for (let x = -buffer; x < CHUNK_SIZE + buffer; x++) {
+                    for (let z = -buffer; z < CHUNK_SIZE + buffer; z++) {
+                        const h = getTerrainHeight(startX + x, startZ + z);
+                        const idx = (x + buffer) + totalSize * (z + buffer);
+                        heightMap[idx] = h;
+                    }
+                }
+
                 for (let x = 0; x < CHUNK_SIZE; x++) {
                     for (let z = 0; z < CHUNK_SIZE; z++) {
-                        const h = getTerrainHeight(startX + x, startZ + z);
+                        const h = getHeight(x, z);
                         for (let y = 0; y <= h; y++) {
                             this.setBlock(x, y, z, y === h ? BLOCKS.GRASS : (y > h - 4 ? BLOCKS.DIRT : BLOCKS.STONE));
                         }
                     }
                 }
-                const buffer = 3; 
+                
                 for (let x = -buffer; x < CHUNK_SIZE + buffer; x++) {
                     for (let z = -buffer; z < CHUNK_SIZE + buffer; z++) {
-                        if (isTreeRoot(startX + x, startZ + z)) {
-                            this.drawTree(x, getTerrainHeight(startX + x, startZ + z) + 1, z);
+                        const treeNoise = noise2D((startX + x) * 0.5, (startZ + z) * 0.5); 
+                        if (treeNoise > 0.85) {
+                            const h = getHeight(x, z);
+                            if (h < WORLD_HEIGHT - 10) this.drawTree(x, h + 1, z);
                         }
                     }
                 }
@@ -380,126 +444,186 @@
             buildMesh() {
                 if (this.mesh) { this.mesh.geometry.dispose(); scene.remove(this.mesh); }
 
-                let vIdx = 0;
-                let cIdx = 0;
-                let uIdx = 0;
-
+                let vIdx = 0, cIdx = 0, uIdx = 0, nIdx = 0;
                 const numTypes = BLOCK_PROPS.length - 1;
                 const uvStep = 1 / numTypes;
                 const chunkCX = this.cx * CHUNK_SIZE;
                 const chunkCZ = this.cz * CHUNK_SIZE;
                 
-                const step = this.lod; 
+                // --- 1. FILL PADDED BUFFER (Optimization Step) ---
+                // Copy strictly local data
+                paddedBuffer.fill(0);
+                
+                // Helper to safely get neighbor block ID
+                const getSafeBlock = (cx, cz, lx, ly, lz) => {
+                    const c = chunks.get(`${cx},${cz}`);
+                    if (!c) return 0; // Treat unloaded chunks as AIR so boundaries face them are drawn (prevents holes)
+                    return c.getBlock(lx, ly, lz);
+                };
 
-                // Neighbors
+                // Fill the padded buffer [1..16] range
+                for (let y = 0; y < WORLD_HEIGHT; y++) {
+                    for (let z = 0; z < CHUNK_SIZE; z++) {
+                        for (let x = 0; x < CHUNK_SIZE; x++) {
+                            const idx = (x + 1) + (z + 1) * PADDED_STRIDE_Z + y * PADDED_STRIDE_Y;
+                            paddedBuffer[idx] = this.data[x + CHUNK_SIZE * (z + CHUNK_SIZE * y)];
+                        }
+                    }
+                }
+
+                // Fill Neighbors (Left/Right/Front/Back) into the buffer padding
+                // This allows the inner loop to run without function calls
                 const nPX = chunks.get(`${this.cx+1},${this.cz}`);
                 const nNX = chunks.get(`${this.cx-1},${this.cz}`);
                 const nPZ = chunks.get(`${this.cx},${this.cz+1}`);
                 const nNZ = chunks.get(`${this.cx},${this.cz-1}`);
 
-                // Helper: Get best block for a volume (LOD Support)
-                const getVolumeBlock = (lx, ly, lz) => {
-                    if (step === 1) return this.getBlock(lx, ly, lz);
+                for (let y = 0; y < WORLD_HEIGHT; y++) {
+                    for (let i = 0; i < CHUNK_SIZE; i++) {
+                        // -X Neighbor (Left)
+                        let b = nNX ? nNX.getBlock(CHUNK_SIZE-1, y, i) : 0;
+                        paddedBuffer[0 + (i+1)*PADDED_STRIDE_Z + y*PADDED_STRIDE_Y] = b;
+                        
+                        // +X Neighbor (Right)
+                        b = nPX ? nPX.getBlock(0, y, i) : 0;
+                        paddedBuffer[(CHUNK_SIZE+1) + (i+1)*PADDED_STRIDE_Z + y*PADDED_STRIDE_Y] = b;
 
-                    // Count block types in the volume (step x step x step)
-                    const counts = new Uint8Array(BLOCK_TYPE_COUNT).fill(0);
-                    let maxCount = 0;
-                    let dominantBlock = 0;
-                    
-                    for (let dx = 0; dx < step; dx++) {
-                        for (let dy = 0; dy < step; dy++) {
-                            for (let dz = 0; dz < step; dz++) {
-                                const b = this.getBlock(lx+dx, ly+dy, lz+dz);
-                                
-                                if (b !== BLOCKS.AIR) {
-                                    counts[b]++;
-                                    if (counts[b] > maxCount) {
-                                        maxCount = counts[b];
-                                        dominantBlock = b;
-                                    }
-                                }
-                            }
-                        }
+                        // -Z Neighbor (Back)
+                        b = nNZ ? nNZ.getBlock(i, y, CHUNK_SIZE-1) : 0;
+                        paddedBuffer[(i+1) + 0*PADDED_STRIDE_Z + y*PADDED_STRIDE_Y] = b;
+
+                        // +Z Neighbor (Front)
+                        b = nPZ ? nPZ.getBlock(i, y, 0) : 0;
+                        paddedBuffer[(i+1) + (CHUNK_SIZE+1)*PADDED_STRIDE_Z + y*PADDED_STRIDE_Y] = b;
                     }
-                    return dominantBlock; 
-                };
+                }
 
-                // Helper: Check neighborhood for visibility
-                const isNeighborVolumeSolid = (cx, cy, cz) => {
-                    if (step === 1) {
-                         // Standard visibility check for LOD 1
-                         const b = this.getBlock(cx, cy, cz);
-                         return b !== 0 && !BLOCK_PROPS[b].transparent;
-                    }
-                    
-                    let targetChunk = this;
-                    let lx = cx; let ly = cy; let lz = cz;
-
-                    // Handle Boundaries
-                    if (lx < 0) { targetChunk = nNX; lx += CHUNK_SIZE; }
-                    else if (lx >= CHUNK_SIZE) { targetChunk = nPX; lx -= CHUNK_SIZE; }
-                    else if (lz < 0) { targetChunk = nNZ; lz += CHUNK_SIZE; }
-                    else if (lz >= CHUNK_SIZE) { targetChunk = nPZ; lz -= CHUNK_SIZE; }
-                    
-                    if (!targetChunk) return false; 
-
-                    // Scan the volume in the neighbor (step x step x step area)
-                    for (let dx = 0; dx < step; dx++) {
-                        for (let dy = 0; dy < step; dy++) {
-                            for (let dz = 0; dz < step; dz++) {
-                                if (ly + dy >= WORLD_HEIGHT || ly + dy < 0) return false; 
-
-                                const b = targetChunk.getBlock(lx+dx, ly+dy, lz+dz);
-                                if (b === 0 || (BLOCK_PROPS[b] && BLOCK_PROPS[b].transparent)) {
-                                    return false; // Found a non-solid block (Air/Leaves), so the face is VISIBLE
-                                }
-                            }
-                        }
-                    }
-                    return true; // Entire neighboring volume is solid, so face is hidden
-                };
-                
-                
-                for (let y = 0; y < WORLD_HEIGHT; y += step) {
-                    for (let x = 0; x < CHUNK_SIZE; x += step) {
-                        for (let z = 0; z < CHUNK_SIZE; z += step) {
+                // --- 2. BUILD MESH FROM BUFFER (Zero boundary checks) ---
+                for (let y = 0; y < WORLD_HEIGHT; y++) {
+                    const yOffset = y * PADDED_STRIDE_Y;
+                    for (let z = 0; z < CHUNK_SIZE; z++) {
+                        const zOffset = (z + 1) * PADDED_STRIDE_Z;
+                        for (let x = 0; x < CHUNK_SIZE; x++) {
                             
-                            const block = getVolumeBlock(x, y, z);
+                            const bIdx = (x + 1) + zOffset + yOffset;
+                            const block = paddedBuffer[bIdx];
                             if (block === 0) continue;
 
-                            for (let i = 0; i < 6; i++) {
-                                const dx = DIRS[i][0] * step;
-                                const dy = DIRS[i][1] * step;
-                                const dz = DIRS[i][2] * step;
-                                
-                                const nx = x + dx; 
-                                const ny = y + dy; 
-                                const nz = z + dz;
-                                
-                                // Face is visible if the neighboring volume is NOT solid
-                                if (!isNeighborVolumeSolid(nx, ny, nz)) {
-                                    if (vIdx + 18 >= MAX_GEOM_SIZE * 3) break; 
-                                    const vOffset = i * 12;
-                                    const b = FACE_BRIGHTNESS[i];
-                                    const u0 = (block - 1) * uvStep;
-                                    const u1 = u0 + uvStep;
+                            // +X Right
+                            const bRight = paddedBuffer[bIdx + 1];
+                            if (bRight === 0 || (BLOCK_PROPS[bRight] && BLOCK_PROPS[bRight].transparent)) {
+                                if (vIdx + 18 < MAX_GEOM_SIZE * 3) {
+                                    // Mesh Building Code (Inlined for speed)
+                                    const u0 = (block - 1) * uvStep, u1 = u0 + uvStep;
+                                    scratchPos[vIdx++] = x+1; scratchPos[vIdx++] = y; scratchPos[vIdx++] = z+1;
+                                    scratchPos[vIdx++] = x+1; scratchPos[vIdx++] = y; scratchPos[vIdx++] = z;
+                                    scratchPos[vIdx++] = x+1; scratchPos[vIdx++] = y+1; scratchPos[vIdx++] = z;
+                                    scratchPos[vIdx++] = x+1; scratchPos[vIdx++] = y; scratchPos[vIdx++] = z+1;
+                                    scratchPos[vIdx++] = x+1; scratchPos[vIdx++] = y+1; scratchPos[vIdx++] = z;
+                                    scratchPos[vIdx++] = x+1; scratchPos[vIdx++] = y+1; scratchPos[vIdx++] = z+1;
+                                    for(let k=0; k<6; k++) { scratchNor[nIdx++] = 1; scratchNor[nIdx++] = 0; scratchNor[nIdx++] = 0; }
+                                    for(let k=0; k<18; k++) scratchCol[cIdx++] = 1.0;
+                                    scratchUV[uIdx++]=u0; scratchUV[uIdx++]=0; scratchUV[uIdx++]=u1; scratchUV[uIdx++]=0;
+                                    scratchUV[uIdx++]=u1; scratchUV[uIdx++]=1; scratchUV[uIdx++]=u0; scratchUV[uIdx++]=0;
+                                    scratchUV[uIdx++]=u1; scratchUV[uIdx++]=1; scratchUV[uIdx++]=u0; scratchUV[uIdx++]=1;
+                                }
+                            }
 
-                                    // Vertices scaled by 'step'
-                                    scratchPos[vIdx++] = x + BOX_POS[vOffset] * step;   scratchPos[vIdx++] = y + BOX_POS[vOffset+1] * step;   scratchPos[vIdx++] = z + BOX_POS[vOffset+2] * step;
-                                    scratchPos[vIdx++] = x + BOX_POS[vOffset+3] * step; scratchPos[vIdx++] = y + BOX_POS[vOffset+4] * step; scratchPos[vIdx++] = z + BOX_POS[vOffset+5] * step;
-                                    scratchPos[vIdx++] = x + BOX_POS[vOffset+6] * step; scratchPos[vIdx++] = y + BOX_POS[vOffset+7] * step; scratchPos[vIdx++] = z + BOX_POS[vOffset+8] * step;
-                                    scratchPos[vIdx++] = x + BOX_POS[vOffset] * step;   scratchPos[vIdx++] = y + BOX_POS[vOffset+1] * step;   scratchPos[vIdx++] = z + BOX_POS[vOffset+2] * step;
-                                    scratchPos[vIdx++] = x + BOX_POS[vOffset+6] * step; scratchPos[vIdx++] = y + BOX_POS[vOffset+7] * step; scratchPos[vIdx++] = z + BOX_POS[vOffset+8] * step;
-                                    scratchPos[vIdx++] = x + BOX_POS[vOffset+9] * step; scratchPos[vIdx++] = y + BOX_POS[vOffset+10] * step; scratchPos[vIdx++] = z + BOX_POS[vOffset+11] * step;
+                            // -X Left
+                            const bLeft = paddedBuffer[bIdx - 1];
+                            if (bLeft === 0 || (BLOCK_PROPS[bLeft] && BLOCK_PROPS[bLeft].transparent)) {
+                                if (vIdx + 18 < MAX_GEOM_SIZE * 3) {
+                                    const u0 = (block - 1) * uvStep, u1 = u0 + uvStep;
+                                    scratchPos[vIdx++] = x; scratchPos[vIdx++] = y; scratchPos[vIdx++] = z;
+                                    scratchPos[vIdx++] = x; scratchPos[vIdx++] = y; scratchPos[vIdx++] = z+1;
+                                    scratchPos[vIdx++] = x; scratchPos[vIdx++] = y+1; scratchPos[vIdx++] = z+1;
+                                    scratchPos[vIdx++] = x; scratchPos[vIdx++] = y; scratchPos[vIdx++] = z;
+                                    scratchPos[vIdx++] = x; scratchPos[vIdx++] = y+1; scratchPos[vIdx++] = z+1;
+                                    scratchPos[vIdx++] = x; scratchPos[vIdx++] = y+1; scratchPos[vIdx++] = z;
+                                    for(let k=0; k<6; k++) { scratchNor[nIdx++] = -1; scratchNor[nIdx++] = 0; scratchNor[nIdx++] = 0; }
+                                    for(let k=0; k<18; k++) scratchCol[cIdx++] = 1.0;
+                                    scratchUV[uIdx++]=u0; scratchUV[uIdx++]=0; scratchUV[uIdx++]=u1; scratchUV[uIdx++]=0;
+                                    scratchUV[uIdx++]=u1; scratchUV[uIdx++]=1; scratchUV[uIdx++]=u0; scratchUV[uIdx++]=0;
+                                    scratchUV[uIdx++]=u1; scratchUV[uIdx++]=1; scratchUV[uIdx++]=u0; scratchUV[uIdx++]=1;
+                                }
+                            }
 
-                                    for(let k=0; k<18; k++) scratchCol[cIdx++] = b;
+                            // +Y Top
+                            // Optimization: Check Y bounds
+                            let bTop = 0;
+                            if (y < WORLD_HEIGHT - 1) bTop = paddedBuffer[bIdx + PADDED_STRIDE_Y];
+                            if (bTop === 0 || (BLOCK_PROPS[bTop] && BLOCK_PROPS[bTop].transparent)) {
+                                if (vIdx + 18 < MAX_GEOM_SIZE * 3) {
+                                    const u0 = (block - 1) * uvStep, u1 = u0 + uvStep;
+                                    scratchPos[vIdx++] = x; scratchPos[vIdx++] = y+1; scratchPos[vIdx++] = z+1;
+                                    scratchPos[vIdx++] = x+1; scratchPos[vIdx++] = y+1; scratchPos[vIdx++] = z+1;
+                                    scratchPos[vIdx++] = x+1; scratchPos[vIdx++] = y+1; scratchPos[vIdx++] = z;
+                                    scratchPos[vIdx++] = x; scratchPos[vIdx++] = y+1; scratchPos[vIdx++] = z+1;
+                                    scratchPos[vIdx++] = x+1; scratchPos[vIdx++] = y+1; scratchPos[vIdx++] = z;
+                                    scratchPos[vIdx++] = x; scratchPos[vIdx++] = y+1; scratchPos[vIdx++] = z;
+                                    for(let k=0; k<6; k++) { scratchNor[nIdx++] = 0; scratchNor[nIdx++] = 1; scratchNor[nIdx++] = 0; }
+                                    for(let k=0; k<18; k++) scratchCol[cIdx++] = 1.0;
+                                    scratchUV[uIdx++]=u0; scratchUV[uIdx++]=0; scratchUV[uIdx++]=u1; scratchUV[uIdx++]=0;
+                                    scratchUV[uIdx++]=u1; scratchUV[uIdx++]=1; scratchUV[uIdx++]=u0; scratchUV[uIdx++]=0;
+                                    scratchUV[uIdx++]=u1; scratchUV[uIdx++]=1; scratchUV[uIdx++]=u0; scratchUV[uIdx++]=1;
+                                }
+                            }
 
-                                    scratchUV[uIdx++] = u0; scratchUV[uIdx++] = 0;
-                                    scratchUV[uIdx++] = u1; scratchUV[uIdx++] = 0;
-                                    scratchUV[uIdx++] = u1; scratchUV[uIdx++] = 1;
-                                    scratchUV[uIdx++] = u0; scratchUV[uIdx++] = 0;
-                                    scratchUV[uIdx++] = u1; scratchUV[uIdx++] = 1;
-                                    scratchUV[uIdx++] = u0; scratchUV[uIdx++] = 1;
+                            // -Y Bottom
+                            let bBot = 0;
+                            if (y > 0) bBot = paddedBuffer[bIdx - PADDED_STRIDE_Y];
+                            if (bBot === 0 || (BLOCK_PROPS[bBot] && BLOCK_PROPS[bBot].transparent)) {
+                                if (vIdx + 18 < MAX_GEOM_SIZE * 3) {
+                                    const u0 = (block - 1) * uvStep, u1 = u0 + uvStep;
+                                    scratchPos[vIdx++] = x; scratchPos[vIdx++] = y; scratchPos[vIdx++] = z;
+                                    scratchPos[vIdx++] = x+1; scratchPos[vIdx++] = y; scratchPos[vIdx++] = z;
+                                    scratchPos[vIdx++] = x+1; scratchPos[vIdx++] = y; scratchPos[vIdx++] = z+1;
+                                    scratchPos[vIdx++] = x; scratchPos[vIdx++] = y; scratchPos[vIdx++] = z;
+                                    scratchPos[vIdx++] = x+1; scratchPos[vIdx++] = y; scratchPos[vIdx++] = z+1;
+                                    scratchPos[vIdx++] = x; scratchPos[vIdx++] = y; scratchPos[vIdx++] = z+1;
+                                    for(let k=0; k<6; k++) { scratchNor[nIdx++] = 0; scratchNor[nIdx++] = -1; scratchNor[nIdx++] = 0; }
+                                    for(let k=0; k<18; k++) scratchCol[cIdx++] = 1.0;
+                                    scratchUV[uIdx++]=u0; scratchUV[uIdx++]=0; scratchUV[uIdx++]=u1; scratchUV[uIdx++]=0;
+                                    scratchUV[uIdx++]=u1; scratchUV[uIdx++]=1; scratchUV[uIdx++]=u0; scratchUV[uIdx++]=0;
+                                    scratchUV[uIdx++]=u1; scratchUV[uIdx++]=1; scratchUV[uIdx++]=u0; scratchUV[uIdx++]=1;
+                                }
+                            }
+
+                            // +Z Front
+                            const bFront = paddedBuffer[bIdx + PADDED_STRIDE_Z];
+                            if (bFront === 0 || (BLOCK_PROPS[bFront] && BLOCK_PROPS[bFront].transparent)) {
+                                if (vIdx + 18 < MAX_GEOM_SIZE * 3) {
+                                    const u0 = (block - 1) * uvStep, u1 = u0 + uvStep;
+                                    scratchPos[vIdx++] = x; scratchPos[vIdx++] = y; scratchPos[vIdx++] = z+1;
+                                    scratchPos[vIdx++] = x+1; scratchPos[vIdx++] = y; scratchPos[vIdx++] = z+1;
+                                    scratchPos[vIdx++] = x+1; scratchPos[vIdx++] = y+1; scratchPos[vIdx++] = z+1;
+                                    scratchPos[vIdx++] = x; scratchPos[vIdx++] = y; scratchPos[vIdx++] = z+1;
+                                    scratchPos[vIdx++] = x+1; scratchPos[vIdx++] = y+1; scratchPos[vIdx++] = z+1;
+                                    scratchPos[vIdx++] = x; scratchPos[vIdx++] = y+1; scratchPos[vIdx++] = z+1;
+                                    for(let k=0; k<6; k++) { scratchNor[nIdx++] = 0; scratchNor[nIdx++] = 0; scratchNor[nIdx++] = 1; }
+                                    for(let k=0; k<18; k++) scratchCol[cIdx++] = 1.0;
+                                    scratchUV[uIdx++]=u0; scratchUV[uIdx++]=0; scratchUV[uIdx++]=u1; scratchUV[uIdx++]=0;
+                                    scratchUV[uIdx++]=u1; scratchUV[uIdx++]=1; scratchUV[uIdx++]=u0; scratchUV[uIdx++]=0;
+                                    scratchUV[uIdx++]=u1; scratchUV[uIdx++]=1; scratchUV[uIdx++]=u0; scratchUV[uIdx++]=1;
+                                }
+                            }
+
+                            // -Z Back
+                            const bBack = paddedBuffer[bIdx - PADDED_STRIDE_Z];
+                            if (bBack === 0 || (BLOCK_PROPS[bBack] && BLOCK_PROPS[bBack].transparent)) {
+                                if (vIdx + 18 < MAX_GEOM_SIZE * 3) {
+                                    const u0 = (block - 1) * uvStep, u1 = u0 + uvStep;
+                                    scratchPos[vIdx++] = x+1; scratchPos[vIdx++] = y; scratchPos[vIdx++] = z;
+                                    scratchPos[vIdx++] = x; scratchPos[vIdx++] = y; scratchPos[vIdx++] = z;
+                                    scratchPos[vIdx++] = x; scratchPos[vIdx++] = y+1; scratchPos[vIdx++] = z;
+                                    scratchPos[vIdx++] = x+1; scratchPos[vIdx++] = y; scratchPos[vIdx++] = z;
+                                    scratchPos[vIdx++] = x; scratchPos[vIdx++] = y+1; scratchPos[vIdx++] = z;
+                                    scratchPos[vIdx++] = x+1; scratchPos[vIdx++] = y+1; scratchPos[vIdx++] = z;
+                                    for(let k=0; k<6; k++) { scratchNor[nIdx++] = 0; scratchNor[nIdx++] = 0; scratchNor[nIdx++] = -1; }
+                                    for(let k=0; k<18; k++) scratchCol[cIdx++] = 1.0;
+                                    scratchUV[uIdx++]=u0; scratchUV[uIdx++]=0; scratchUV[uIdx++]=u1; scratchUV[uIdx++]=0;
+                                    scratchUV[uIdx++]=u1; scratchUV[uIdx++]=1; scratchUV[uIdx++]=u0; scratchUV[uIdx++]=0;
+                                    scratchUV[uIdx++]=u1; scratchUV[uIdx++]=1; scratchUV[uIdx++]=u0; scratchUV[uIdx++]=1;
                                 }
                             }
                         }
@@ -510,19 +634,22 @@
                 geometry.setAttribute('position', new THREE.BufferAttribute(scratchPos.slice(0, vIdx), 3));
                 geometry.setAttribute('uv', new THREE.BufferAttribute(scratchUV.slice(0, uIdx), 2));
                 geometry.setAttribute('color', new THREE.BufferAttribute(scratchCol.slice(0, cIdx), 3));
+                geometry.setAttribute('normal', new THREE.BufferAttribute(scratchNor.slice(0, nIdx), 3));
                 
-                // Select Material based on LOD
-                const mat = this.lod === 1 ? materialHigh : materialLow;
+                geometry.computeBoundingSphere();
 
-                this.mesh = new THREE.Mesh(geometry, mat);
+                this.mesh = new THREE.Mesh(geometry, standardMaterial);
                 this.mesh.position.set(chunkCX, 0, chunkCZ);
+                this.mesh.castShadow = true;
+                this.mesh.receiveShadow = true;
+                
                 this.mesh.matrixAutoUpdate = false; 
                 this.mesh.updateMatrix();
                 scene.add(this.mesh);
             }
         }
 
-        // --- GLOBAL WORLD HELPERS WITH CACHE ---
+        // --- GLOBAL WORLD HELPERS ---
         
         function getChunk(cx, cz) {
             const key = `${cx},${cz}`;
@@ -557,22 +684,18 @@
             if (chunk) {
                 let lx = x % CHUNK_SIZE; if(lx < 0) lx += CHUNK_SIZE;
                 let lz = z % CHUNK_SIZE; if(lz < 0) lz += CHUNK_SIZE;
+                
                 chunk.setBlock(lx, y, lz, id);
                 chunk.buildMesh(); 
                 
-                if (lx === 0) updateChunkMesh(cx - 1, cz);
-                if (lx === CHUNK_SIZE - 1) updateChunkMesh(cx + 1, cz);
-                if (lz === 0) updateChunkMesh(cx, cz - 1);
-                if (lz === CHUNK_SIZE - 1) updateChunkMesh(cx, cz + 1);
+                if (lx === 0) { const c = chunks.get(`${cx-1},${cz}`); if(c) c.buildMesh(); }
+                if (lx === CHUNK_SIZE - 1) { const c = chunks.get(`${cx+1},${cz}`); if(c) c.buildMesh(); }
+                if (lz === 0) { const c = chunks.get(`${cx},${cz-1}`); if(c) c.buildMesh(); }
+                if (lz === CHUNK_SIZE - 1) { const c = chunks.get(`${cx},${cz+1}`); if(c) c.buildMesh(); }
             }
         }
-        function updateChunkMesh(cx, cz) {
-            const chunk = chunks.get(`${cx},${cz}`);
-            // Force rebuild is needed when neighbor changes state (block added/removed)
-            if (chunk) chunk.buildMesh();
-        }
 
-        // --- UPDATE LOOP WITH THROTTLING ---
+        // --- OPTIMIZED CHUNK QUEUE ---
         function queueChunks(force = false) {
             const px = Math.floor(camera.position.x / CHUNK_SIZE);
             const pz = Math.floor(camera.position.z / CHUNK_SIZE);
@@ -582,40 +705,21 @@
             lastChunkCheckZ = pz;
 
             chunkQueue = [];
-            chunkUpdateQueue = [];
-
-            const lodDistSq = Math.pow(renderDistance * LOD_RATIO, 2);
-
-            for (let x = -renderDistance; x <= renderDistance; x++) {
-                for (let z = -renderDistance; z <= renderDistance; z++) {
-                    const d2 = x*x + z*z;
-                    if (d2 > renderDistance*renderDistance) continue;
-                    
-                    const cx = px + x;
-                    const cz = pz + z;
-                    const key = `${cx},${cz}`;
-                    
-                    // LOD 2 (Geometric + Texture) kicks in beyond LOD_RATIO
-                    const targetLOD = d2 > lodDistSq ? LOD_STEP_FAR : 1;
-
-                    if (!chunks.has(key)) {
-                        chunkQueue.push({cx, cz, dist: d2, lod: targetLOD});
-                    } else {
-                        const chunk = chunks.get(key);
-                        if (chunk.lod !== targetLOD) {
-                            chunkUpdateQueue.push({ chunk: chunk, targetLOD: targetLOD, dist: d2 });
-                        }
-                    }
+            for(let i=0; i<chunkSpiralOffsets.length; i++) {
+                const offset = chunkSpiralOffsets[i];
+                const cx = px + offset.x;
+                const cz = pz + offset.z;
+                const key = `${cx},${cz}`;
+                if (!chunks.has(key)) {
+                    chunkQueue.push({cx, cz});
                 }
             }
             
-            chunkQueue.sort((a, b) => a.dist - b.dist);
-            chunkUpdateQueue.sort((a, b) => a.dist - b.dist);
-            
             let removals = 0;
+            const pruneDist = renderDistance + 1;
             for (const [key, chunk] of chunks.entries()) {
-                if (removals > 5) break; 
-                if (Math.abs(chunk.cx - px) > renderDistance + 2 || Math.abs(chunk.cz - pz) > renderDistance + 2) {
+                if (removals > 4) break; 
+                if (Math.abs(chunk.cx - px) > pruneDist || Math.abs(chunk.cz - pz) > pruneDist) {
                     scene.remove(chunk.mesh);
                     chunk.mesh.geometry.dispose();
                     chunks.delete(key);
@@ -625,25 +729,28 @@
         }
 
         function processChunkQueue() {
-            if (chunkUpdateQueue.length > 0) {
-                const item = chunkUpdateQueue.shift();
-                item.chunk.lod = item.targetLOD;
-                item.chunk.buildMesh();
-            }
+            const startTime = performance.now();
+            const MAX_FRAME_TIME = 8; 
 
-            if (chunkQueue.length > 0) {
+            while (chunkQueue.length > 0 && performance.now() - startTime < MAX_FRAME_TIME) {
                 const c = chunkQueue.shift();
                 const key = `${c.cx},${c.cz}`;
                 if (!chunks.has(key)) {
                     const chunk = new Chunk(c.cx, c.cz);
-                    chunk.lod = c.lod; 
                     chunks.set(key, chunk);
                     chunk.buildMesh(); 
+                    
+                    const neighbors = [
+                        chunks.get(`${c.cx-1},${c.cz}`),
+                        chunks.get(`${c.cx+1},${c.cz}`),
+                        chunks.get(`${c.cx},${c.cz-1}`),
+                        chunks.get(`${c.cx},${c.cz+1}`)
+                    ];
+                    neighbors.forEach(n => { if(n) n.buildMesh(); });
                 }
             }
 
             document.getElementById('queue').innerText = chunkQueue.length;
-            document.getElementById('lodUpdates').innerText = chunkUpdateQueue.length;
         }
 
         // --- PHYSICS & INPUT ---
@@ -696,9 +803,10 @@
             camera.aspect = window.innerWidth / window.innerHeight;
             camera.updateProjectionMatrix();
             renderer.setSize(window.innerWidth, window.innerHeight);
+            composer.setSize(window.innerWidth, window.innerHeight);
         }
 
-        // --- OPTIMIZED COLLISION LOGIC ---
+        // --- COLLISION LOGIC ---
         function checkWall(x, y, z) {
             const r = 0.3; 
             const levels = [y - 0.8, y + 0.1]; 
@@ -729,6 +837,12 @@
             const time = performance.now();
             const delta = Math.min((time - lastFrame) / 1000, 0.05); 
             lastFrame = time;
+            frameCount++;
+            
+            sunLight.position.x = camera.position.x + 50;
+            sunLight.position.z = camera.position.z + 50;
+            sunLight.target.position.set(camera.position.x, 0, camera.position.z);
+            sunLight.target.updateMatrixWorld();
             
             if (controls.isLocked) {
                 velocity.x -= velocity.x * 10.0 * delta;
@@ -750,32 +864,27 @@
                     velocity.z += _tempVec3.z * forward * speed * delta;
                 }
 
-                const eyeHeight = 1.6;
                 const originalX = camera.position.x;
                 const originalZ = camera.position.z;
 
-                // 1. Move X
                 camera.position.x += velocity.x * delta;
                 if (checkWall(camera.position.x, camera.position.y, camera.position.z)) {
                     camera.position.x = originalX; 
                     velocity.x = 0; 
                 }
 
-                // 2. Move Z
                 camera.position.z += velocity.z * delta;
                 if (checkWall(camera.position.x, camera.position.y, camera.position.z)) {
                     camera.position.z = originalZ; 
                     velocity.z = 0; 
                 }
 
-                // 3. Move Y
                 camera.position.y += velocity.y * delta;
                 
-                // Floor Check
                 if (velocity.y < 0) {
-                    const feetY = camera.position.y - eyeHeight;
+                    const feetY = camera.position.y - 1.6;
                     if (checkFloor(camera.position.x, feetY, camera.position.z)) {
-                        camera.position.y = Math.floor(feetY - 0.01) + 1 + eyeHeight;
+                        camera.position.y = Math.floor(feetY - 0.01) + 1 + 1.6;
                         velocity.y = 0;
                         canJump = true;
                     }
@@ -800,7 +909,7 @@
             
             document.getElementById('fps').innerText = Math.round(1/delta);
             document.getElementById('chunks').innerText = chunks.size;
-            renderer.render(scene, camera);
+            composer.render();
         }
 
         init();
